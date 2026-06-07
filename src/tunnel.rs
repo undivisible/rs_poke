@@ -77,6 +77,12 @@ impl TunnelRunner {
     }
 
     pub async fn start(&mut self) -> Result<TunnelInfo> {
+        tokio::time::timeout(self.options.startup_timeout, self.start_inner())
+            .await
+            .map_err(|_| Error::Protocol("connection timeout".into()))?
+    }
+
+    async fn start_inner(&mut self) -> Result<TunnelInfo> {
         let response: CreateConnectionResponse = self
             .client
             .post_json(
@@ -114,10 +120,9 @@ impl TunnelRunner {
             let _ = events.send(TunnelEvent::Disconnected);
         });
         self.stop = Some(stop_tx);
-        let connected = tokio::time::timeout(self.options.startup_timeout, connected_rx.recv())
+        connected_rx
+            .recv()
             .await
-            .map_err(|_| Error::Protocol("connection timeout".into()))?;
-        connected
             .ok_or_else(|| Error::Protocol("connection closed before upstream connected".into()))?;
         self.activate_tunnel(&info.connection_id).await?;
         let _ = self.events.send(TunnelEvent::Connected(info.clone()));

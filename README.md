@@ -18,7 +18,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rs_poke = "0.1.2"
+rs_poke = "0.1.3"
 ```
 
 ## Usage
