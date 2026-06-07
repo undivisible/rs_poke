@@ -18,7 +18,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rs_poke = "0.1.1"
+rs_poke = "0.1.2"
 ```
 
 ## Usage
@@ -57,6 +57,7 @@ async fn tunnel_example() -> Result<(), Box<dyn std::error::Error> {
         name: "my-tunnel".into(),
         cleanup_on_stop: true,
         sync_interval: std::time::Duration::from_secs(30),
+        startup_timeout: std::time::Duration::from_secs(30),
     });
 
     // Start the tunnel

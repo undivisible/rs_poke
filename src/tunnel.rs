@@ -12,6 +12,7 @@ pub struct TunnelOptions {
     pub name: String,
     pub cleanup_on_stop: bool,
     pub sync_interval: Duration,
+    pub startup_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -113,9 +114,10 @@ impl TunnelRunner {
             let _ = events.send(TunnelEvent::Disconnected);
         });
         self.stop = Some(stop_tx);
-        tokio::time::timeout(Duration::from_secs(30), connected_rx.recv())
+        let connected = tokio::time::timeout(self.options.startup_timeout, connected_rx.recv())
             .await
-            .map_err(|_| Error::Protocol("connection timeout".into()))?
+            .map_err(|_| Error::Protocol("connection timeout".into()))?;
+        connected
             .ok_or_else(|| Error::Protocol("connection closed before upstream connected".into()))?;
         self.activate_tunnel(&info.connection_id).await?;
         let _ = self.events.send(TunnelEvent::Connected(info.clone()));
