@@ -39,6 +39,7 @@ pub struct TunnelInfo {
 
 #[derive(Clone, Debug)]
 pub enum TunnelEvent {
+    Created(TunnelInfo),
     Connected(TunnelInfo),
     Disconnected,
     ToolsSynced { tool_count: usize },
@@ -86,6 +87,14 @@ impl TunnelRunner {
                 }),
             )
             .await?;
+        let info = TunnelInfo {
+            connection_id: response.id.clone(),
+            tunnel_url: response.server_url,
+            local_url: self.options.url.clone(),
+            name: self.options.name.clone(),
+        };
+        self.info = Some(info.clone());
+        let _ = self.events.send(TunnelEvent::Created(info.clone()));
         let local_addr = local_addr(&self.options.url)?;
         let (stop_tx, stop_rx) = watch::channel(false);
         let (connected_tx, mut connected_rx) = mpsc::unbounded_channel();
@@ -108,14 +117,7 @@ impl TunnelRunner {
             .await
             .map_err(|_| Error::Protocol("connection timeout".into()))?
             .ok_or_else(|| Error::Protocol("connection closed before upstream connected".into()))?;
-        let info = TunnelInfo {
-            connection_id: response.id,
-            tunnel_url: response.server_url,
-            local_url: self.options.url.clone(),
-            name: self.options.name.clone(),
-        };
         self.activate_tunnel(&info.connection_id).await?;
-        self.info = Some(info.clone());
         let _ = self.events.send(TunnelEvent::Connected(info.clone()));
         Ok(info)
     }

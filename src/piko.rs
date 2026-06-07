@@ -6,13 +6,11 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 const HEADER_LEN: usize = 12;
-const DEFAULT_WINDOW: u32 = 256 * 1024;
 const MAX_RESPONSE_BODY: usize = 64 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 
@@ -283,7 +281,9 @@ async fn proxy_stream<W>(
 where
     W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send + 'static,
 {
-    let request = read_http_request(&mut input).await?;
+    let request = read_http_request(&mut input)
+        .await
+        .and_then(parse_request)?;
     let response = forward_http(&local_addr, request)
         .await
         .unwrap_or_else(|_| {
@@ -350,23 +350,133 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
-async fn forward_http(local_addr: &str, request: Bytes) -> Result<Bytes> {
-    let mut stream = tokio::net::TcpStream::connect(local_addr).await?;
-    stream.write_all(&request).await?;
-    stream.shutdown().await?;
-    let mut response = Vec::new();
-    stream
-        .take(MAX_RESPONSE_BODY as u64)
-        .read_to_end(&mut response)
-        .await?;
-    Ok(Bytes::from(response))
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+}
+
+fn parse_request(bytes: Bytes) -> Result<HttpRequest> {
+    let header_end =
+        find_header_end(&bytes).ok_or_else(|| Error::Protocol("headers incomplete".into()))?;
+    let header_text = std::str::from_utf8(&bytes[..header_end])
+        .map_err(|err| Error::Protocol(err.to_string()))?;
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| Error::Protocol("request line missing".into()))?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| Error::Protocol("request method missing".into()))?
+        .to_string();
+    let raw_path = parts
+        .next()
+        .ok_or_else(|| Error::Protocol("request path missing".into()))?;
+    let path = normalize_request_path(raw_path);
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if is_hop_by_hop_header(name) || name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    Ok(HttpRequest {
+        method,
+        path,
+        headers,
+        body: bytes.slice(header_end..),
+    })
+}
+
+fn normalize_request_path(raw_path: &str) -> String {
+    if let Ok(url) = url::Url::parse(raw_path) {
+        let mut path = url.path().to_string();
+        if path.is_empty() {
+            path.push('/');
+        }
+        if let Some(query) = url.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        path
+    } else if raw_path.starts_with('/') {
+        raw_path.to_string()
+    } else {
+        format!("/{raw_path}")
+    }
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host" | "transfer-encoding" | "connection" | "keep-alive" | "te" | "trailer" | "upgrade"
+    )
+}
+
+async fn forward_http(local_addr: &str, request: HttpRequest) -> Result<Bytes> {
+    let client = reqwest::Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
+        .build()?;
+    let method = reqwest::Method::from_bytes(request.method.as_bytes())
+        .map_err(|err| Error::Protocol(err.to_string()))?;
+    let mut builder = client
+        .request(method, format!("http://{local_addr}{}", request.path))
+        .header("host", local_addr);
+    for (name, value) in request.headers {
+        builder = builder.header(name, value);
+    }
+    if !request.body.is_empty() {
+        builder = builder.body(request.body);
+    }
+    let response = builder.send().await?;
+    build_response(response).await
+}
+
+async fn build_response(response: reqwest::Response) -> Result<Bytes> {
+    let status = response.status();
+    let reason = status.canonical_reason().unwrap_or("OK");
+    let mut headers = Vec::new();
+    for (name, value) in response.headers() {
+        if is_hop_by_hop_header(name.as_str())
+            || name.as_str().eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            headers.push((name.as_str().to_string(), value.to_string()));
+        }
+    }
+    let body = response.bytes().await?;
+    if body.len() > MAX_RESPONSE_BODY {
+        return Err(Error::Protocol("response body exceeds size limit".into()));
+    }
+    let mut bytes = BytesMut::new();
+    bytes.extend_from_slice(format!("HTTP/1.1 {} {reason}\r\n", status.as_u16()).as_bytes());
+    for (name, value) in headers {
+        bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    bytes.extend_from_slice(format!("content-length: {}\r\n\r\n", body.len()).as_bytes());
+    bytes.extend_from_slice(&body);
+    Ok(bytes.freeze())
 }
 
 async fn send_data<W>(write: &Arc<Mutex<W>>, stream_id: u32, data: Bytes) -> Result<()>
 where
     W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send + 'static,
 {
-    for chunk in data.chunks(DEFAULT_WINDOW as usize) {
+    for chunk in data.chunks(256 * 1024) {
         send_frame(
             write,
             FrameHeader {
@@ -437,5 +547,23 @@ mod tests {
             parse_content_length(b"POST / HTTP/1.1\r\nContent-Length: 12\r\n\r\n"),
             Some(12)
         );
+    }
+
+    #[test]
+    fn parses_request_like_js_proxy() {
+        let request = parse_request(Bytes::from_static(
+            b"POST http://tunnel.poke.com/abc/mcp?x=1 HTTP/1.1\r\nHost: tunnel.poke.com\r\nConnection: keep-alive\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        ))
+        .expect("request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/abc/mcp?x=1");
+        assert_eq!(
+            request.headers,
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Content-Length".to_string(), "2".to_string())
+            ]
+        );
+        assert_eq!(request.body.as_ref(), b"{}");
     }
 }
