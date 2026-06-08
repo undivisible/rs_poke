@@ -15,6 +15,8 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 const HEADER_LEN: usize = 12;
 const MAX_RESPONSE_BODY: usize = 64 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+const DEFAULT_STREAM_WINDOW: u32 = 256 * 1024;
+const DATA_CHUNK_SIZE: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -212,6 +214,29 @@ async fn connect_and_serve(config: PikoConfig) -> Result<()> {
         }
     });
     let streams = Arc::new(Mutex::new(HashMap::<u32, StreamState>::new()));
+    let keepalive_write = Arc::clone(&write);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if send_frame(
+                &keepalive_write,
+                FrameHeader {
+                    frame_type: FrameType::Ping,
+                    flags: Flags::SYN,
+                    stream_id: 0,
+                    length: 0,
+                },
+                Bytes::new(),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
     while let Some((header, payload)) = frame_rx.recv().await {
         match header.frame_type {
             FrameType::Ping if header.flags.contains(Flags::SYN) => {
@@ -249,10 +274,14 @@ where
 {
     if header.flags.contains(Flags::SYN) {
         let (tx, rx) = mpsc::unbounded_channel();
-        streams
-            .lock()
-            .await
-            .insert(header.stream_id, StreamState { tx });
+        let flow = Arc::new(Mutex::new(StreamFlow::new()));
+        streams.lock().await.insert(
+            header.stream_id,
+            StreamState {
+                tx,
+                flow: Arc::clone(&flow),
+            },
+        );
         let local_addr = config.local_addr.clone();
         let write = Arc::clone(write);
         let streams = Arc::clone(streams);
@@ -269,15 +298,34 @@ where
         )
         .await?;
         tokio::spawn(async move {
-            let _ = proxy_stream(stream_id, local_addr, write, rx).await;
+            let _ = proxy_stream(stream_id, local_addr, write, rx, flow).await;
             streams.lock().await.remove(&stream_id);
         });
     }
     let flags = header.flags.without(Flags::SYN);
-    if header.frame_type == FrameType::Data && !payload.is_empty() {
+    if header.frame_type == FrameType::WindowUpdate && header.length > 0 {
         let streams = streams.lock().await;
         if let Some(stream) = streams.get(&header.stream_id) {
-            let _ = stream.tx.send(StreamInput::Data(payload));
+            let mut flow = stream.flow.lock().await;
+            flow.send_window = flow.send_window.saturating_add(header.length);
+        }
+    }
+    if header.frame_type == FrameType::Data && !payload.is_empty() {
+        let forward = {
+            let streams = streams.lock().await;
+            streams.get(&header.stream_id).map(|stream| {
+                (
+                    stream.tx.clone(),
+                    Arc::clone(&stream.flow),
+                    payload.len() as u32,
+                )
+            })
+        };
+        if let Some((tx, flow, size)) = forward {
+            let _ = tx.send(StreamInput::Data(payload));
+            let mut flow = flow.lock().await;
+            flow.recv_window = flow.recv_window.saturating_sub(size);
+            maybe_send_recv_window_update(write, header.stream_id, &mut flow).await?;
         }
     }
     if flags.contains(Flags::FIN) || flags.contains(Flags::RST) {
@@ -289,8 +337,52 @@ where
     Ok(())
 }
 
+struct StreamFlow {
+    recv_window: u32,
+    max_window: u32,
+    send_window: u32,
+}
+
+impl StreamFlow {
+    fn new() -> Self {
+        Self {
+            recv_window: DEFAULT_STREAM_WINDOW,
+            max_window: DEFAULT_STREAM_WINDOW,
+            send_window: DEFAULT_STREAM_WINDOW,
+        }
+    }
+}
+
 struct StreamState {
     tx: mpsc::UnboundedSender<StreamInput>,
+    flow: Arc<Mutex<StreamFlow>>,
+}
+
+async fn maybe_send_recv_window_update<W>(
+    write: &Arc<Mutex<W>>,
+    stream_id: u32,
+    flow: &mut StreamFlow,
+) -> Result<()>
+where
+    W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send + 'static,
+{
+    let consumed = flow.max_window.saturating_sub(flow.recv_window);
+    if consumed < flow.max_window / 2 {
+        return Ok(());
+    }
+    let increment = flow.max_window.saturating_sub(flow.recv_window);
+    flow.recv_window = flow.recv_window.saturating_add(increment);
+    send_frame(
+        write,
+        FrameHeader {
+            frame_type: FrameType::WindowUpdate,
+            flags: Flags(0),
+            stream_id,
+            length: increment,
+        },
+        Bytes::new(),
+    )
+    .await
 }
 
 enum StreamInput {
@@ -303,6 +395,7 @@ async fn proxy_stream<W>(
     local_addr: String,
     write: Arc<Mutex<W>>,
     mut input: mpsc::UnboundedReceiver<StreamInput>,
+    flow: Arc<Mutex<StreamFlow>>,
 ) -> Result<()>
 where
     W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send + 'static,
@@ -315,7 +408,7 @@ where
         .unwrap_or_else(|_| {
             Bytes::from_static(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 11\r\n\r\nBad Gateway")
         });
-    send_data(&write, stream_id, response).await?;
+    send_data(&write, stream_id, response, &flow).await?;
     send_frame(
         &write,
         FrameHeader {
@@ -701,11 +794,19 @@ fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-async fn send_data<W>(write: &Arc<Mutex<W>>, stream_id: u32, data: Bytes) -> Result<()>
+async fn send_data<W>(
+    write: &Arc<Mutex<W>>,
+    stream_id: u32,
+    data: Bytes,
+    flow: &Arc<Mutex<StreamFlow>>,
+) -> Result<()>
 where
     W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send + 'static,
 {
-    for chunk in data.chunks(256 * 1024) {
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let chunk_len = wait_for_send_window(flow, data.len() - offset).await?;
+        let chunk = &data[offset..offset + chunk_len];
         send_frame(
             write,
             FrameHeader {
@@ -717,8 +818,23 @@ where
             Bytes::copy_from_slice(chunk),
         )
         .await?;
+        offset += chunk_len;
     }
     Ok(())
+}
+
+async fn wait_for_send_window(flow: &Arc<Mutex<StreamFlow>>, remaining: usize) -> Result<usize> {
+    loop {
+        let mut guard = flow.lock().await;
+        if guard.send_window > 0 {
+            let allowed = guard.send_window as usize;
+            let chunk_len = remaining.min(DATA_CHUNK_SIZE).min(allowed);
+            guard.send_window -= chunk_len as u32;
+            return Ok(chunk_len);
+        }
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 async fn send_frame<W>(write: &Arc<Mutex<W>>, header: FrameHeader, payload: Bytes) -> Result<()>
