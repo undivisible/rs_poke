@@ -1,6 +1,7 @@
 use crate::{Error, Result, get_token};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use std::fmt;
 
 const DEFAULT_API: &str = "https://poke.com/api/v1";
 
@@ -26,8 +27,21 @@ pub struct Poke {
     client: reqwest::Client,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct Webhook {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SendMessageResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SendWebhookResponse {
+    pub success: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CreateWebhookResponse {
+    #[serde(rename = "triggerId")]
+    pub trigger_id: String,
     #[serde(rename = "webhookUrl")]
     pub webhook_url: String,
     #[serde(rename = "webhookToken")]
@@ -38,6 +52,42 @@ pub struct Webhook {
 pub struct CreateWebhook<'a> {
     pub condition: &'a str,
     pub action: &'a str,
+}
+
+#[derive(Debug)]
+pub struct PokeAuthError {
+    message: String,
+}
+
+impl PokeAuthError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for PokeAuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PokeAuthError {}
+
+impl From<PokeAuthError> for Error {
+    fn from(value: PokeAuthError) -> Self {
+        Self::Auth(value.message)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FetchWithAuthOptions<'a> {
+    pub path: &'a str,
+    pub method: reqwest::Method,
+    pub body: Option<Value>,
+    pub token: Option<String>,
+    pub base_url: Option<String>,
 }
 
 impl Poke {
@@ -58,7 +108,11 @@ impl Poke {
         &self.api_key
     }
 
-    pub async fn send_message(&self, message: &str) -> Result<Value> {
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub async fn send_message(&self, message: &str) -> Result<SendMessageResponse> {
         self.post_json(
             "/inbound/api-message",
             &serde_json::json!({ "message": message }),
@@ -66,7 +120,7 @@ impl Poke {
         .await
     }
 
-    pub async fn create_webhook(&self, request: CreateWebhook<'_>) -> Result<Webhook> {
+    pub async fn create_webhook(&self, request: CreateWebhook<'_>) -> Result<CreateWebhookResponse> {
         self.post_json("/api-keys/webhook", &request).await
     }
 
@@ -75,7 +129,7 @@ impl Poke {
         webhook_url: &str,
         webhook_token: &str,
         data: Value,
-    ) -> Result<Value> {
+    ) -> Result<SendWebhookResponse> {
         let response = self
             .client
             .post(webhook_url)
@@ -101,16 +155,7 @@ impl Poke {
             .json(body)
             .send()
             .await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(Error::Auth("invalid api key".into()));
-        }
-        if response.status() == reqwest::StatusCode::FORBIDDEN {
-            return Err(Error::Auth("api key lacks permission".into()));
-        }
-        if !response.status().is_success() {
-            return Err(Error::Api(format_web_error("Poke API", response).await));
-        }
-        Ok(response.json().await?)
+        map_api_response("Poke API", response).await?.json().await.map_err(Into::into)
     }
 
     pub async fn raw_auth(
@@ -119,19 +164,62 @@ impl Poke {
         path: &str,
         body: Option<Value>,
     ) -> Result<reqwest::Response> {
-        let mut request = self
-            .client
-            .request(method, format!("{}{}", self.base_url, path))
-            .bearer_auth(&self.api_key);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send().await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(Error::Auth("session expired".into()));
-        }
-        Ok(response)
+        fetch_with_auth(FetchWithAuthOptions {
+            path,
+            method,
+            body,
+            token: Some(self.api_key.clone()),
+            base_url: Some(self.base_url.clone()),
+        })
+        .await
     }
+}
+
+pub async fn fetch_with_auth(options: FetchWithAuthOptions<'_>) -> Result<reqwest::Response> {
+    let token = options
+        .token
+        .or_else(|| std::env::var("POKE_API_KEY").ok())
+        .or_else(|| get_token().ok().flatten())
+        .ok_or_else(|| Error::Auth("not logged in. Run 'poke login'.".into()))?;
+    let base_url = options
+        .base_url
+        .unwrap_or_else(|| std::env::var("POKE_API").unwrap_or_else(|_| DEFAULT_API.to_string()));
+    let client = reqwest::Client::new();
+    let mut request = client
+        .request(
+            options.method,
+            format!("{}{}", base_url, options.path),
+        )
+        .bearer_auth(token);
+    if let Some(body) = options.body {
+        request = request.json(&body);
+    }
+    let response = request.send().await?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Error::Auth("session expired. Run 'poke login' again.".into()));
+    }
+    Ok(response)
+}
+
+pub(crate) async fn map_api_response(
+    prefix: &str,
+    response: reqwest::Response,
+) -> Result<reqwest::Response> {
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Error::Auth("invalid api key".into()));
+    }
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err(Error::Auth("api key lacks permission".into()));
+    }
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(Error::Api(format!(
+            "{prefix} error (429): rate limited. Please slow down and retry."
+        )));
+    }
+    if !response.status().is_success() {
+        return Err(Error::Api(format_web_error(prefix, response).await));
+    }
+    Ok(response)
 }
 
 pub(crate) async fn format_web_error(prefix: &str, response: reqwest::Response) -> String {

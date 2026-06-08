@@ -1,15 +1,22 @@
-use crate::api::{self, Poke};
+use crate::api::{self, fetch_with_auth, FetchWithAuthOptions, Poke};
 use crate::piko::{PikoConfig, run_client};
 use crate::{Error, Result};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
 
 #[derive(Clone, Debug)]
 pub struct TunnelOptions {
     pub url: String,
     pub name: String,
+    pub token: Option<String>,
+    pub base_url: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
     pub cleanup_on_stop: bool,
     pub sync_interval: Duration,
     pub startup_timeout: Duration,
@@ -20,6 +27,10 @@ impl Default for TunnelOptions {
         Self {
             url: String::new(),
             name: String::new(),
+            token: None,
+            base_url: None,
+            client_id: None,
+            client_secret: None,
             cleanup_on_stop: true,
             sync_interval: Duration::from_secs(300),
             startup_timeout: Duration::from_secs(30),
@@ -60,12 +71,18 @@ pub enum TunnelEvent {
     Error(String),
 }
 
+type TunnelHandler = Box<dyn Fn(&TunnelEvent) + Send + Sync>;
+
 pub struct TunnelRunner {
     client: Poke,
     options: TunnelOptions,
     events: broadcast::Sender<TunnelEvent>,
+    handlers: Arc<Mutex<HashMap<String, Vec<TunnelHandler>>>>,
     stop: Option<watch::Sender<bool>>,
+    sync_stop: Option<watch::Sender<bool>>,
+    sync_task: Option<JoinHandle<()>>,
     info: Option<TunnelInfo>,
+    connected: bool,
 }
 
 impl TunnelRunner {
@@ -75,8 +92,12 @@ impl TunnelRunner {
             client,
             options,
             events,
+            handlers: Arc::new(Mutex::new(HashMap::new())),
             stop: None,
+            sync_stop: None,
+            sync_task: None,
             info: None,
+            connected: false,
         }
     }
 
@@ -84,8 +105,29 @@ impl TunnelRunner {
         self.events.subscribe()
     }
 
+    pub fn on<F>(&self, event: &str, handler: F) -> &Self
+    where
+        F: Fn(&TunnelEvent) + Send + Sync + 'static,
+    {
+        self.handlers
+            .lock()
+            .expect("handlers lock")
+            .entry(event.to_string())
+            .or_default()
+            .push(Box::new(handler));
+        self
+    }
+
+    pub fn off(&self, event: &str) {
+        self.handlers.lock().expect("handlers lock").remove(event);
+    }
+
     pub fn info(&self) -> Option<&TunnelInfo> {
         self.info.as_ref()
+    }
+
+    pub fn connected(&self) -> bool {
+        self.connected
     }
 
     pub async fn start(&mut self) -> Result<TunnelInfo> {
@@ -93,17 +135,19 @@ impl TunnelRunner {
     }
 
     async fn start_inner(&mut self) -> Result<TunnelInfo> {
-        let response: CreateConnectionResponse = self
-            .client
-            .post_json(
-                "/mcp/connections/cli",
-                &serde_json::json!({
-                    "name": self.options.name,
-                    "serverUrl": self.options.url,
-                    "tunnel": true
-                }),
-            )
-            .await?;
+        let mut body = serde_json::json!({
+            "name": self.options.name,
+            "serverUrl": self.options.url,
+            "tunnel": true
+        });
+        if let Some(client_id) = &self.options.client_id {
+            body["clientId"] = Value::String(client_id.clone());
+        }
+        if let Some(client_secret) = &self.options.client_secret {
+            body["clientSecret"] = Value::String(client_secret.clone());
+        }
+        let response = self.fetch_auth_json("/mcp/connections/cli", body).await?;
+        let response: CreateConnectionResponse = serde_json::from_value(response)?;
         let info = TunnelInfo {
             connection_id: response.id.clone(),
             tunnel_url: response.server_url,
@@ -111,7 +155,7 @@ impl TunnelRunner {
             name: self.options.name.clone(),
         };
         self.info = Some(info.clone());
-        let _ = self.events.send(TunnelEvent::Created(info.clone()));
+        self.emit(TunnelEvent::Created(info.clone()));
         let local_addr = local_addr(&self.options.url)?;
         let (stop_tx, stop_rx) = watch::channel(false);
         let (connected_tx, mut connected_rx) = mpsc::unbounded_channel();
@@ -126,11 +170,12 @@ impl TunnelRunner {
             errors: Some(error_tx),
         };
         let events = self.events.clone();
+        let handlers = Arc::clone(&self.handlers);
         tokio::spawn(async move {
             if let Err(err) = run_client(config, stop_rx).await {
-                let _ = events.send(TunnelEvent::Error(err.to_string()));
+                emit_event(&events, &handlers, TunnelEvent::Error(err.to_string()));
             }
-            let _ = events.send(TunnelEvent::Disconnected);
+            emit_event(&events, &handlers, TunnelEvent::Disconnected);
         });
         self.stop = Some(stop_tx);
         let deadline = tokio::time::sleep(self.options.startup_timeout);
@@ -159,11 +204,14 @@ impl TunnelRunner {
             result = self.activate_tunnel(&info.connection_id) => result?,
             _ = &mut deadline => return Err(Error::Protocol("connection timeout during activation".into())),
         }
-        let _ = self.events.send(TunnelEvent::Connected(info.clone()));
+        self.connected = true;
+        self.emit(TunnelEvent::Connected(info.clone()));
+        self.start_sync_timer();
         Ok(info)
     }
 
     pub async fn stop(&mut self) -> Result<()> {
+        self.stop_sync_timer();
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(true);
         }
@@ -172,7 +220,34 @@ impl TunnelRunner {
         {
             let _ = self.delete_connection(&info.connection_id).await;
         }
+        self.connected = false;
         Ok(())
+    }
+
+    pub async fn create_recipe(&self, name: Option<&str>) -> Result<String> {
+        let Some(info) = &self.info else {
+            return Err(Error::msg("tunnel is not started"));
+        };
+        let response = self
+            .fetch_auth(
+                reqwest::Method::POST,
+                &format!("/mcp/connections/{}/create-recipe", info.connection_id),
+                Some(serde_json::json!({
+                    "name": name.unwrap_or(&self.options.name)
+                })),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(Error::Api(format!(
+                "failed to create recipe (HTTP {})",
+                response.status()
+            )));
+        }
+        let body = response.json::<Value>().await?;
+        body.get("link")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| Error::Api("create-recipe response missing link".into()))
     }
 
     pub async fn sync_tools(&self) -> Result<usize> {
@@ -180,8 +255,7 @@ impl TunnelRunner {
             return Err(Error::msg("tunnel is not started"));
         };
         let response = self
-            .client
-            .raw_auth(
+            .fetch_auth(
                 reqwest::Method::POST,
                 &format!("/mcp/connections/{}/sync-tools", info.connection_id),
                 None,
@@ -193,13 +267,12 @@ impl TunnelRunner {
             return Err(Error::Api(message));
         }
         let body = response.json::<Value>().await?;
-        parse_sync_tools_body(&body, &self.events)
+        parse_sync_tools_body(&body, &self.events, &self.handlers)
     }
 
     async fn activate_tunnel(&self, connection_id: &str) -> Result<()> {
         let response = self
-            .client
-            .raw_auth(
+            .fetch_auth(
                 reqwest::Method::POST,
                 &format!("/mcp/connections/{connection_id}/activate-tunnel"),
                 None,
@@ -210,7 +283,7 @@ impl TunnelRunner {
             if body.get("status").and_then(Value::as_str) == Some("oauth_required")
                 && let Some(url) = body.get("authUrl").and_then(Value::as_str)
             {
-                let _ = self.events.send(TunnelEvent::OAuthRequired {
+                self.emit(TunnelEvent::OAuthRequired {
                     auth_url: url.to_string(),
                 });
             }
@@ -224,8 +297,7 @@ impl TunnelRunner {
 
     pub async fn delete_connection(&self, connection_id: &str) -> Result<()> {
         let _ = self
-            .client
-            .raw_auth(
+            .fetch_auth(
                 reqwest::Method::DELETE,
                 &format!("/mcp/connections/{connection_id}"),
                 None,
@@ -233,18 +305,174 @@ impl TunnelRunner {
             .await?;
         Ok(())
     }
+
+    async fn fetch_auth(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<reqwest::Response> {
+        fetch_with_auth(FetchWithAuthOptions {
+            path,
+            method,
+            body,
+            token: self
+                .options
+                .token
+                .clone()
+                .or_else(|| Some(self.client.api_key().to_string())),
+            base_url: self
+                .options
+                .base_url
+                .clone()
+                .or_else(|| Some(self.client.base_url().to_string())),
+        })
+        .await
+    }
+
+    async fn fetch_auth_json(&self, path: &str, body: Value) -> Result<Value> {
+        let response = self
+            .fetch_auth(reqwest::Method::POST, path, Some(body))
+            .await?;
+        if !response.status().is_success() {
+            let message = api::format_web_error("tunnel", response).await;
+            return Err(Error::Api(format!("failed to create tunnel: {message}")));
+        }
+        Ok(response.json().await?)
+    }
+
+    fn emit(&self, event: TunnelEvent) {
+        emit_event(&self.events, &self.handlers, event);
+    }
+
+    fn start_sync_timer(&mut self) {
+        if self.options.sync_interval.is_zero() {
+            return;
+        }
+        let (sync_stop_tx, mut sync_stop_rx) = watch::channel(false);
+        let interval = self.options.sync_interval;
+        let events = self.events.clone();
+        let handlers = Arc::clone(&self.handlers);
+        let runner = SyncRunner {
+            client: self.client.clone(),
+            options: self.options.clone(),
+            info: self.info.clone(),
+        };
+        self.sync_stop = Some(sync_stop_tx);
+        self.sync_task = Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = sync_stop_rx.changed() => {
+                        if *sync_stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        if let Some(info) = &runner.info
+                            && let Ok(response) = runner
+                                .fetch_auth(
+                                    reqwest::Method::POST,
+                                    &format!("/mcp/connections/{}/sync-tools", info.connection_id),
+                                    None,
+                                )
+                                .await
+                            && response.status().is_success()
+                            && let Ok(body) = response.json::<Value>().await
+                        {
+                            let _ = parse_sync_tools_body(&body, &events, &handlers);
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    fn stop_sync_timer(&mut self) {
+        if let Some(sync_stop) = self.sync_stop.take() {
+            let _ = sync_stop.send(true);
+        }
+        if let Some(task) = self.sync_task.take() {
+            task.abort();
+        }
+    }
 }
 
-fn parse_sync_tools_body(body: &Value, events: &broadcast::Sender<TunnelEvent>) -> Result<usize> {
+#[derive(Clone)]
+struct SyncRunner {
+    client: Poke,
+    options: TunnelOptions,
+    info: Option<TunnelInfo>,
+}
+
+impl SyncRunner {
+    async fn fetch_auth(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<reqwest::Response> {
+        fetch_with_auth(FetchWithAuthOptions {
+            path,
+            method,
+            body,
+            token: self
+                .options
+                .token
+                .clone()
+                .or_else(|| Some(self.client.api_key().to_string())),
+            base_url: self
+                .options
+                .base_url
+                .clone()
+                .or_else(|| Some(self.client.base_url().to_string())),
+        })
+        .await
+    }
+}
+
+fn emit_event(
+    events: &broadcast::Sender<TunnelEvent>,
+    handlers: &Arc<Mutex<HashMap<String, Vec<TunnelHandler>>>>,
+    event: TunnelEvent,
+) {
+    let key = match &event {
+        TunnelEvent::Connected(_) => "connected",
+        TunnelEvent::Disconnected => "disconnected",
+        TunnelEvent::Error(_) => "error",
+        TunnelEvent::ToolsSynced { .. } => "toolsSynced",
+        TunnelEvent::OAuthRequired { .. } => "oauthRequired",
+        TunnelEvent::Created(_) => "created",
+    };
+    if let Ok(guard) = handlers.lock()
+        && let Some(list) = guard.get(key)
+    {
+        for handler in list {
+            handler(&event);
+        }
+    }
+    let _ = events.send(event);
+}
+
+fn parse_sync_tools_body(
+    body: &Value,
+    events: &broadcast::Sender<TunnelEvent>,
+    handlers: &Arc<Mutex<HashMap<String, Vec<TunnelHandler>>>>,
+) -> Result<usize> {
     if body
         .get("requiresOAuth")
         .and_then(Value::as_bool)
         .unwrap_or(false)
         && let Some(url) = body.get("oauthUrl").and_then(Value::as_str)
     {
-        let _ = events.send(TunnelEvent::OAuthRequired {
-            auth_url: url.to_string(),
-        });
+        emit_event(
+            events,
+            handlers,
+            TunnelEvent::OAuthRequired {
+                auth_url: url.to_string(),
+            },
+        );
         return Ok(0);
     }
     let count = parse_tool_count(body);
@@ -254,7 +482,11 @@ fn parse_sync_tools_body(body: &Value, events: &broadcast::Sender<TunnelEvent>) 
             eprintln!("\x1b[2m[bridge] sync-tools returned 0 tools (status: {status})\x1b[0m");
         }
     }
-    let _ = events.send(TunnelEvent::ToolsSynced { tool_count: count });
+    emit_event(
+        events,
+        handlers,
+        TunnelEvent::ToolsSynced { tool_count: count },
+    );
     Ok(count)
 }
 
@@ -311,21 +543,23 @@ mod tests {
     #[test]
     fn parse_sync_tools_body_counts_tools() {
         let (events, _) = broadcast::channel(1);
+        let handlers = Arc::new(Mutex::new(HashMap::new()));
         let body = serde_json::json!({
             "tools": [{ "name": "run_command" }, { "name": "read_file" }]
         });
-        let count = parse_sync_tools_body(&body, &events).expect("tools parse");
+        let count = parse_sync_tools_body(&body, &events, &handlers).expect("tools parse");
         assert_eq!(count, 2);
     }
 
     #[test]
     fn parse_sync_tools_body_emits_oauth_required() {
         let (events, mut rx) = broadcast::channel(1);
+        let handlers = Arc::new(Mutex::new(HashMap::new()));
         let body = serde_json::json!({
             "requiresOAuth": true,
             "oauthUrl": "https://poke.com/oauth"
         });
-        let count = parse_sync_tools_body(&body, &events).expect("oauth parse");
+        let count = parse_sync_tools_body(&body, &events, &handlers).expect("oauth parse");
         assert_eq!(count, 0);
         match rx.try_recv().expect("oauth event") {
             TunnelEvent::OAuthRequired { auth_url } => {

@@ -68,7 +68,36 @@ impl CredentialsStore {
     }
 }
 
+pub fn config_dir() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .ok_or(Error::NotLoggedIn)?;
+    Ok(base.join("poke"))
+}
+
+pub fn credentials_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("credentials.json"))
+}
+
+pub fn save_credentials(token: &str) -> Result<()> {
+    CredentialsStore::default_store()?.write(token)
+}
+
+pub fn load_credentials() -> Result<Option<Token>> {
+    CredentialsStore::default_store()?.read()
+}
+
+pub fn delete_credentials() -> Result<()> {
+    CredentialsStore::default_store()?.remove()
+}
+
 #[derive(Clone, Debug)]
+pub struct LoginCodeInfo {
+    pub user_code: String,
+    pub login_url: String,
+}
+
 pub struct LoginOptions {
     pub api_base: String,
     pub frontend_base: String,
@@ -76,6 +105,7 @@ pub struct LoginOptions {
     pub timeout: Duration,
     pub poll_interval: Duration,
     pub store: CredentialsStore,
+    on_code: Option<Box<dyn Fn(LoginCodeInfo) + Send + Sync>>,
 }
 
 impl LoginOptions {
@@ -88,8 +118,22 @@ impl LoginOptions {
             timeout: Duration::from_secs(300),
             poll_interval: Duration::from_secs(2),
             store,
+            on_code: None,
         }
     }
+
+    pub fn on_code<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(LoginCodeInfo) + Send + Sync + 'static,
+    {
+        self.on_code = Some(Box::new(handler));
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LoginResult {
+    pub token: String,
 }
 
 #[derive(Deserialize)]
@@ -116,9 +160,11 @@ pub fn is_logged_in() -> bool {
     get_token().ok().flatten().is_some()
 }
 
-pub async fn login(options: LoginOptions) -> Result<String> {
+pub async fn login(options: LoginOptions) -> Result<LoginResult> {
     if let Some(token) = options.store.read()? {
-        return Ok(token.token);
+        return Ok(LoginResult {
+            token: token.token,
+        });
     }
     let client = reqwest::Client::new();
     let code = client
@@ -133,6 +179,12 @@ pub async fn login(options: LoginOptions) -> Result<String> {
         options.frontend_base,
         url::form_urlencoded::byte_serialize(code.user_code.as_bytes()).collect::<String>()
     );
+    if let Some(on_code) = &options.on_code {
+        on_code(LoginCodeInfo {
+            user_code: code.user_code.clone(),
+            login_url: login_url.clone(),
+        });
+    }
     if options.open_browser {
         open_browser(&login_url);
     }
@@ -146,7 +198,6 @@ pub async fn login(options: LoginOptions) -> Result<String> {
             ))
             .send()
             .await?
-            .error_for_status()?
             .json::<PollResponse>()
             .await?;
         match response.status.as_str() {
@@ -155,7 +206,7 @@ pub async fn login(options: LoginOptions) -> Result<String> {
                     .token
                     .ok_or_else(|| Error::Auth("login response did not include a token".into()))?;
                 options.store.write(&token)?;
-                return Ok(token);
+                return Ok(LoginResult { token });
             }
             "expired" => return Err(Error::Auth("login code expired".into())),
             "invalid" => return Err(Error::Auth("invalid login code".into())),
@@ -165,8 +216,8 @@ pub async fn login(options: LoginOptions) -> Result<String> {
     Err(Error::Auth("login timed out".into()))
 }
 
-pub fn logout() -> Result<()> {
-    CredentialsStore::default_store()?.remove()
+pub async fn logout() -> Result<()> {
+    delete_credentials()
 }
 
 fn open_browser(url: &str) {

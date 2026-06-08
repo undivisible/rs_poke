@@ -2,7 +2,7 @@
 
 Rust client and tunnel bridge for Poke.
 
-A library for interacting with the Poke API, providing both a synchronous HTTP client interface and an asynchronous WebSocket tunnel for MCP (Model Context Protocol) connections.
+A library and CLI for interacting with the Poke API, providing both an HTTP client interface and an asynchronous WebSocket tunnel for MCP (Model Context Protocol) connections. API parity with the official `poke@0.4.2` npm SDK.
 
 ## Features
 
@@ -10,6 +10,7 @@ A library for interacting with the Poke API, providing both a synchronous HTTP c
 - **Tunnel Bridge**: WebSocket-based tunnel for MCP protocol connections
 - **Webhook Support**: Create and manage webhooks programmatically
 - **Message Passing**: Send messages through the Poke API
+- **CLI**: `poke login`, `poke logout`, `poke whoami`, `poke mcp add`
 - **Async-First**: Built on Tokio for efficient async/await patterns
 
 ## Installation
@@ -18,7 +19,13 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rs_poke = "0.1.3"
+rs_poke = "0.2.0"
+```
+
+Or install the CLI:
+
+```bash
+cargo install rs_poke
 ```
 
 ## Usage
@@ -28,17 +35,18 @@ rs_poke = "0.1.3"
 ```rust
 use rs_poke::{Poke, PokeOptions};
 
-async fn example() -> Result<(), Box<dyn std::error::Error> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Poke::new(PokeOptions::default())?;
 
-    // Send a message
     let response = client.send_message("Hello, world!").await?;
+    println!("{}", response.message);
 
-    // Create a webhook
     let webhook = client.create_webhook(&rs_poke::CreateWebhook {
         condition: "event.type == 'trigger'",
         action: "POST",
     }).await?;
+    println!("trigger: {}", webhook.trigger_id);
 
     Ok(())
 }
@@ -48,37 +56,34 @@ async fn example() -> Result<(), Box<dyn std::error::Error> {
 
 ```rust
 use rs_poke::{Poke, TunnelOptions, TunnelRunner};
-use tokio::sync::broadcast;
 
-async fn tunnel_example() -> Result<(), Box<dyn std::error::Error> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let poke = Poke::new(rs_poke::PokeOptions::default())?;
     let mut runner = TunnelRunner::new(poke, TunnelOptions {
         url: "http://127.0.0.1:52333/mcp".into(),
         name: "my-tunnel".into(),
         cleanup_on_stop: true,
-        sync_interval: std::time::Duration::from_secs(30),
+        sync_interval: std::time::Duration::from_secs(300),
         startup_timeout: std::time::Duration::from_secs(30),
+        ..TunnelOptions::default()
     });
 
-    // Start the tunnel
     let info = runner.start().await?;
+    println!("Tunnel connected: {}", info.tunnel_url);
 
-    // Subscribe to events
     let mut events = runner.subscribe();
-    tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            match event {
-                rs_poke::TunnelEvent::Connected(info) => {
-                    println!("Tunnel connected: {}", info.tunnel_url);
-                }
-                rs_poke::TunnelEvent::Disconnected => {
-                    println!("Tunnel disconnected");
-                }
-                _ => {}
+    while let Ok(event) = events.recv().await {
+        match event {
+            rs_poke::TunnelEvent::Connected(info) => {
+                println!("Connected: {}", info.tunnel_url);
             }
+            rs_poke::TunnelEvent::Disconnected => break,
+            _ => {}
         }
-    });
+    }
 
+    runner.stop().await?;
     Ok(())
 }
 ```
@@ -86,23 +91,23 @@ async fn tunnel_example() -> Result<(), Box<dyn std::error::Error> {
 ### Authentication
 
 ```rust
-use rs_poke::{login, logout, is_logged_in};
+use rs_poke::{login, logout, is_logged_in, CredentialsStore, LoginOptions};
 
-async fn auth_example() -> Result<(), Box<dyn std::error::Error>> {
-    // Login with credentials
-    login(rs_poke::LoginOptions {
-        api_key: Some("your-api-key".into()),
-        base_url: Some("https://poke.com/api/v1".into()),
-    }).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = CredentialsStore::default_store()?;
+    let result = login(
+        LoginOptions::new(store).on_code(|info| {
+            println!("Open {} and enter {}", info.login_url, info.user_code);
+        }),
+    )
+    .await?;
 
-    // Check auth status
-    if is_logged_in().await {
-        println!("Already authenticated");
+    if is_logged_in() {
+        println!("Authenticated as {}", result.token);
     }
 
-    // Logout
     logout().await?;
-
     Ok(())
 }
 ```
@@ -111,51 +116,53 @@ async fn auth_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Environment Variables
 
-- `POKE_API_URL` - Base URL for Poke API (default: `https://poke.com/api/v1`)
+- `POKE_API` - Base URL for Poke API (default: `https://poke.com/api/v1`)
 - `POKE_API_KEY` - API key for authentication
+- `POKE_FRONTEND` - Frontend URL for device login (default: `https://poke.com`)
 
 ### Credentials Store
 
 Credentials are stored in the user's configuration directory:
-- **Linux**: `~/.config/rs_poke/credentials.json`
-- **macOS**: `~/Library/Application Support/rs_poke/credentials.json`
-- **Windows**: `%APPDATA%\rs_poke\credentials.json`
+- **Linux**: `~/.config/poke/credentials.json`
+- **macOS**: `~/Library/Application Support/poke/credentials.json` (via XDG_CONFIG_HOME or `~/.config/poke`)
+- **Windows**: `%APPDATA%\poke\credentials.json` (via XDG_CONFIG_HOME)
 
 ## API Reference
 
 ### `Poke`
 
-Main API client struct.
-
 - `new(options: PokeOptions)` - Create a new client
-- `api_key()` - Get the configured API key
-- `send_message(message: &str)` - Send a message to Poke
-- `create_webhook(request: CreateWebhook)` - Create a new webhook
+- `api_key()` / `base_url()` - Get configured credentials and endpoint
+- `send_message(message)` - Send a message to Poke
+- `create_webhook(request)` - Create a new webhook (returns `trigger_id`)
 - `send_webhook(url, token, data)` - Send data to a webhook endpoint
+- `post_json(path, body)` - Authenticated JSON POST helper
+- `raw_auth(method, path, body)` - Low-level authenticated request
 
 ### `TunnelRunner`
 
-Manages MCP tunnel connections.
-
-- `new(client: Poke, options: TunnelOptions)` - Create a runner
+- `new(client, options)` - Create a runner
 - `start()` - Start the tunnel connection
 - `stop()` - Stop and optionally cleanup the tunnel
 - `sync_tools()` - Synchronize MCP tools
-- `subscribe()` - Subscribe to tunnel events
+- `create_recipe(name)` - Create a shareable recipe link
+- `connected()` - Whether the tunnel is active
+- `subscribe()` / `on(event, handler)` / `off(event)` - Event handling
+
+### CLI
+
+```bash
+poke login
+poke logout
+poke whoami
+poke mcp add http://127.0.0.1:52333/mcp -n my-server --recipe
+```
 
 ## Development
 
 ```bash
-# Clone the repository
-git clone https://github.com/undivisible/rs_poke
-
-# Run tests
 cargo test
-
-# Run with linting
 cargo clippy --all-targets --all-features
-
-# Format code
 cargo fmt
 ```
 
