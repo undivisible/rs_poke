@@ -1,3 +1,4 @@
+use crate::api::auth_error;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -198,22 +199,23 @@ pub async fn login(options: LoginOptions) -> Result<LoginResult> {
             ))
             .send()
             .await?
+            .error_for_status()?
             .json::<PollResponse>()
             .await?;
         match response.status.as_str() {
             "authenticated" => {
                 let token = response
                     .token
-                    .ok_or_else(|| Error::Auth("login response did not include a token".into()))?;
+                    .ok_or_else(|| auth_error("login response did not include a token"))?;
                 options.store.write(&token)?;
                 return Ok(LoginResult { token });
             }
-            "expired" => return Err(Error::Auth("login code expired".into())),
-            "invalid" => return Err(Error::Auth("invalid login code".into())),
+            "expired" => return Err(auth_error("login code expired")),
+            "invalid" => return Err(auth_error("invalid login code")),
             _ => {}
         }
     }
-    Err(Error::Auth("login timed out".into()))
+    Err(auth_error("login timed out"))
 }
 
 pub async fn logout() -> Result<()> {

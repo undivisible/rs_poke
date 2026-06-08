@@ -19,7 +19,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rs_poke = "0.2.0"
+rs_poke = "0.2.1"
 ```
 
 Or install the CLI:

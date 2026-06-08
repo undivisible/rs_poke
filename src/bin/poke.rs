@@ -72,9 +72,8 @@ async fn cmd_login() -> Result<(), Box<dyn std::error::Error>> {
     let options = LoginOptions::new(store).on_code(|info| {
         println!("Visit {} and enter code {}", info.login_url, info.user_code);
     });
-    let result = login(options).await?;
+    login(options).await?;
     println!("Logged in.");
-    println!("Token: {}", result.token);
     Ok(())
 }
 
@@ -94,6 +93,7 @@ async fn cmd_whoami() -> Result<(), Box<dyn std::error::Error>> {
         body: None,
         token: None,
         base_url: None,
+        client: None,
     })
     .await?;
     if !response.status().is_success() {

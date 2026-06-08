@@ -4,6 +4,7 @@ use crate::{Error, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -82,7 +83,7 @@ pub struct TunnelRunner {
     sync_stop: Option<watch::Sender<bool>>,
     sync_task: Option<JoinHandle<()>>,
     info: Option<TunnelInfo>,
-    connected: bool,
+    connected: Arc<AtomicBool>,
 }
 
 impl TunnelRunner {
@@ -97,7 +98,7 @@ impl TunnelRunner {
             sync_stop: None,
             sync_task: None,
             info: None,
-            connected: false,
+            connected: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -105,21 +106,25 @@ impl TunnelRunner {
         self.events.subscribe()
     }
 
-    pub fn on<F>(&self, event: &str, handler: F) -> &Self
+    pub fn on<F>(&self, event: &str, handler: F) -> Result<&Self>
     where
         F: Fn(&TunnelEvent) + Send + Sync + 'static,
     {
         self.handlers
             .lock()
-            .expect("handlers lock")
+            .map_err(|_| Error::msg("handler lock poisoned"))?
             .entry(event.to_string())
             .or_default()
             .push(Box::new(handler));
-        self
+        Ok(self)
     }
 
-    pub fn off(&self, event: &str) {
-        self.handlers.lock().expect("handlers lock").remove(event);
+    pub fn off(&self, event: &str) -> Result<()> {
+        self.handlers
+            .lock()
+            .map_err(|_| Error::msg("handler lock poisoned"))?
+            .remove(event);
+        Ok(())
     }
 
     pub fn info(&self) -> Option<&TunnelInfo> {
@@ -127,7 +132,7 @@ impl TunnelRunner {
     }
 
     pub fn connected(&self) -> bool {
-        self.connected
+        self.connected.load(Ordering::SeqCst)
     }
 
     pub async fn start(&mut self) -> Result<TunnelInfo> {
@@ -171,10 +176,12 @@ impl TunnelRunner {
         };
         let events = self.events.clone();
         let handlers = Arc::clone(&self.handlers);
+        let connected = Arc::clone(&self.connected);
         tokio::spawn(async move {
             if let Err(err) = run_client(config, stop_rx).await {
                 emit_event(&events, &handlers, TunnelEvent::Error(err.to_string()));
             }
+            connected.store(false, Ordering::SeqCst);
             emit_event(&events, &handlers, TunnelEvent::Disconnected);
         });
         self.stop = Some(stop_tx);
@@ -204,14 +211,14 @@ impl TunnelRunner {
             result = self.activate_tunnel(&info.connection_id) => result?,
             _ = &mut deadline => return Err(Error::Protocol("connection timeout during activation".into())),
         }
-        self.connected = true;
+        self.connected.store(true, Ordering::SeqCst);
         self.emit(TunnelEvent::Connected(info.clone()));
         self.start_sync_timer();
         Ok(info)
     }
 
     pub async fn stop(&mut self) -> Result<()> {
-        self.stop_sync_timer();
+        self.stop_sync_timer().await;
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(true);
         }
@@ -220,7 +227,7 @@ impl TunnelRunner {
         {
             let _ = self.delete_connection(&info.connection_id).await;
         }
-        self.connected = false;
+        self.connected.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -326,6 +333,7 @@ impl TunnelRunner {
                 .base_url
                 .clone()
                 .or_else(|| Some(self.client.base_url().to_string())),
+            client: Some(self.client.http_client()),
         })
         .await
     }
@@ -370,18 +378,34 @@ impl TunnelRunner {
                         }
                     }
                     _ = ticker.tick() => {
-                        if let Some(info) = &runner.info
-                            && let Ok(response) = runner
-                                .fetch_auth(
-                                    reqwest::Method::POST,
-                                    &format!("/mcp/connections/{}/sync-tools", info.connection_id),
-                                    None,
-                                )
-                                .await
-                            && response.status().is_success()
-                            && let Ok(body) = response.json::<Value>().await
+                        let Some(info) = &runner.info else {
+                            continue;
+                        };
+                        match runner
+                            .fetch_auth(
+                                reqwest::Method::POST,
+                                &format!("/mcp/connections/{}/sync-tools", info.connection_id),
+                                None,
+                            )
+                            .await
                         {
-                            let _ = parse_sync_tools_body(&body, &events, &handlers);
+                            Ok(response) if response.status().is_success() => {
+                                if let Ok(body) = response.json::<Value>().await {
+                                    let _ = parse_sync_tools_body(&body, &events, &handlers);
+                                }
+                            }
+                            Ok(response) => {
+                                let message =
+                                    api::format_web_error("sync-tools", response).await;
+                                eprintln!(
+                                    "\x1b[2m[bridge] periodic sync-tools failed (non-fatal): {message}\x1b[0m"
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "\x1b[2m[bridge] periodic sync-tools failed (non-fatal): {err}\x1b[0m"
+                                );
+                            }
                         }
                     }
                 }
@@ -389,12 +413,12 @@ impl TunnelRunner {
         }));
     }
 
-    fn stop_sync_timer(&mut self) {
+    async fn stop_sync_timer(&mut self) {
         if let Some(sync_stop) = self.sync_stop.take() {
             let _ = sync_stop.send(true);
         }
         if let Some(task) = self.sync_task.take() {
-            task.abort();
+            let _ = task.await;
         }
     }
 }
@@ -427,6 +451,7 @@ impl SyncRunner {
                 .base_url
                 .clone()
                 .or_else(|| Some(self.client.base_url().to_string())),
+            client: Some(self.client.http_client()),
         })
         .await
     }

@@ -1,6 +1,9 @@
+//! Rust client and tunnel bridge for Poke.
+
 mod api;
 mod auth;
 mod error;
+mod http_client;
 mod piko;
 mod tunnel;
 
