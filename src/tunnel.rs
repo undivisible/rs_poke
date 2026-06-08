@@ -248,10 +248,18 @@ fn parse_sync_tools_body(body: &Value, events: &broadcast::Sender<TunnelEvent>) 
         return Ok(0);
     }
     let count = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(Vec::len)
+        .get("toolCount")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .or_else(|| body.get("tools").and_then(Value::as_array).map(Vec::len))
         .unwrap_or(0);
+    if count == 0
+        && let Some(status) = body.get("status").and_then(Value::as_str)
+    {
+        let _ = events.send(TunnelEvent::Error(format!(
+            "sync-tools returned 0 tools (status: {status})"
+        )));
+    }
     let _ = events.send(TunnelEvent::ToolsSynced { tool_count: count });
     Ok(count)
 }
