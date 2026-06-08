@@ -77,9 +77,7 @@ impl TunnelRunner {
     }
 
     pub async fn start(&mut self) -> Result<TunnelInfo> {
-        tokio::time::timeout(self.options.startup_timeout, self.start_inner())
-            .await
-            .map_err(|_| Error::Protocol("connection timeout".into()))?
+        self.start_inner().await
     }
 
     async fn start_inner(&mut self) -> Result<TunnelInfo> {
@@ -105,12 +103,15 @@ impl TunnelRunner {
         let local_addr = local_addr(&self.options.url)?;
         let (stop_tx, stop_rx) = watch::channel(false);
         let (connected_tx, mut connected_rx) = mpsc::unbounded_channel();
+        let (error_tx, mut error_rx) = mpsc::unbounded_channel();
         let config = PikoConfig {
             upstream_url: response.tunnel.upstream_url,
             endpoint_id: response.id.clone(),
             token: response.tunnel.token,
             local_addr,
+            connect_timeout: self.options.startup_timeout.min(Duration::from_secs(10)),
             connected: Some(connected_tx),
+            errors: Some(error_tx),
         };
         let events = self.events.clone();
         tokio::spawn(async move {
@@ -120,11 +121,32 @@ impl TunnelRunner {
             let _ = events.send(TunnelEvent::Disconnected);
         });
         self.stop = Some(stop_tx);
-        connected_rx
-            .recv()
-            .await
-            .ok_or_else(|| Error::Protocol("connection closed before upstream connected".into()))?;
-        self.activate_tunnel(&info.connection_id).await?;
+        let deadline = tokio::time::sleep(self.options.startup_timeout);
+        tokio::pin!(deadline);
+        let mut last_error = None;
+        loop {
+            tokio::select! {
+                connected = connected_rx.recv() => {
+                    connected.ok_or_else(|| Error::Protocol("connection closed before upstream connected".into()))?;
+                    break;
+                }
+                error = error_rx.recv() => {
+                    if let Some(error) = error {
+                        last_error = Some(error);
+                    }
+                }
+                _ = &mut deadline => {
+                    let detail = last_error
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default();
+                    return Err(Error::Protocol(format!("connection timeout{detail}")));
+                }
+            }
+        }
+        tokio::select! {
+            result = self.activate_tunnel(&info.connection_id) => result?,
+            _ = &mut deadline => return Err(Error::Protocol("connection timeout during activation".into())),
+        }
         let _ = self.events.send(TunnelEvent::Connected(info.clone()));
         Ok(info)
     }

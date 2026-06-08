@@ -99,7 +99,9 @@ pub(crate) struct PikoConfig {
     pub endpoint_id: String,
     pub token: String,
     pub local_addr: String,
+    pub connect_timeout: Duration,
     pub connected: Option<mpsc::UnboundedSender<()>>,
+    pub errors: Option<mpsc::UnboundedSender<String>>,
 }
 
 pub(crate) fn upstream_ws_url(upstream_url: &str, endpoint_id: &str) -> String {
@@ -126,6 +128,9 @@ pub(crate) async fn run_client(config: PikoConfig, mut stop: watch::Receiver<boo
         match result {
             Ok(()) => attempt = 0,
             Err(err) if is_retriable(&err) => {
+                if let Some(errors) = &config.errors {
+                    let _ = errors.send(err.to_string());
+                }
                 attempt += 1;
                 tokio::select! {
                     _ = stop.changed() => return Ok(()),
@@ -160,7 +165,14 @@ async fn connect_and_serve(config: PikoConfig) -> Result<()> {
         HeaderValue::from_str(&format!("Bearer {}", config.token))
             .map_err(|err| Error::Protocol(err.to_string()))?,
     );
-    let (ws, _) = connect_async(request).await?;
+    let (ws, _) = tokio::time::timeout(config.connect_timeout, connect_async(request))
+        .await
+        .map_err(|_| {
+            Error::Protocol(format!(
+                "upstream websocket timeout after {:?}",
+                config.connect_timeout
+            ))
+        })??;
     if let Some(connected) = &config.connected {
         let _ = connected.send(());
     }
@@ -169,15 +181,27 @@ async fn connect_and_serve(config: PikoConfig) -> Result<()> {
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<(FrameHeader, Bytes)>();
     tokio::spawn(async move {
         let mut read = read;
+        let mut buffer = BytesMut::new();
         while let Some(message) = read.next().await {
             match message {
-                Ok(Message::Binary(bytes)) if bytes.len() >= HEADER_LEN => {
-                    let Ok(header) = FrameHeader::decode(&bytes[..HEADER_LEN]) else {
-                        break;
-                    };
-                    let payload = bytes.slice(HEADER_LEN..);
-                    if frame_tx.send((header, payload)).is_err() {
-                        break;
+                Ok(Message::Binary(bytes)) => {
+                    buffer.extend_from_slice(&bytes);
+                    loop {
+                        if buffer.len() < HEADER_LEN {
+                            break;
+                        }
+                        let Ok(header) = FrameHeader::decode(&buffer[..HEADER_LEN]) else {
+                            return;
+                        };
+                        let total = HEADER_LEN + header.length as usize;
+                        if buffer.len() < total {
+                            break;
+                        }
+                        let frame = buffer.split_to(total).freeze();
+                        let payload = frame.slice(HEADER_LEN..);
+                        if frame_tx.send((header, payload)).is_err() {
+                            return;
+                        }
                     }
                 }
                 Ok(Message::Close(_)) | Err(_) => break,
