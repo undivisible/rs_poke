@@ -247,21 +247,36 @@ fn parse_sync_tools_body(body: &Value, events: &broadcast::Sender<TunnelEvent>) 
         });
         return Ok(0);
     }
-    let count = body
-        .get("toolCount")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .or_else(|| body.get("tools").and_then(Value::as_array).map(Vec::len))
-        .unwrap_or(0);
-    if count == 0
-        && let Some(status) = body.get("status").and_then(Value::as_str)
-    {
-        let _ = events.send(TunnelEvent::Error(format!(
-            "sync-tools returned 0 tools (status: {status})"
-        )));
+    let count = parse_tool_count(body);
+    if count == 0 {
+        eprintln!("\x1b[2m[bridge] sync-tools response: {body}\x1b[0m");
+        if let Some(status) = body.get("status").and_then(Value::as_str) {
+            let _ = events.send(TunnelEvent::Error(format!(
+                "sync-tools returned 0 tools (status: {status})"
+            )));
+        }
     }
     let _ = events.send(TunnelEvent::ToolsSynced { tool_count: count });
     Ok(count)
+}
+
+fn parse_tool_count(body: &Value) -> usize {
+    if body
+        .get("requiresOAuth")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return 0;
+    }
+    for key in ["toolCount", "count", "numTools"] {
+        if let Some(count) = body.get(key).and_then(Value::as_u64) {
+            return count as usize;
+        }
+    }
+    body.get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 fn local_addr(url: &str) -> Result<String> {
