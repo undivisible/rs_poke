@@ -146,8 +146,12 @@ pub(crate) async fn format_web_error(prefix: &str, response: reqwest::Response) 
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| status.to_string());
+        .filter(|value| !value.is_empty());
+    let detail = match detail {
+        Some(detail) if detail != status.canonical_reason().unwrap_or_default() => detail,
+        _ if !text.trim().is_empty() => text.trim().chars().take(500).collect(),
+        _ => status.to_string(),
+    };
     format!("{prefix} error ({status}): {detail}")
 }
 

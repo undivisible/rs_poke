@@ -189,7 +189,7 @@ impl TunnelRunner {
             .await?;
         if !response.status().is_success() {
             let message = api::format_web_error("sync-tools", response).await;
-            let _ = self.events.send(TunnelEvent::Error(message.clone()));
+            eprintln!("\x1b[2m[bridge] sync-tools failed (non-fatal): {message}\x1b[0m");
             return Err(Error::Api(message));
         }
         let body = response.json::<Value>().await?;
@@ -216,7 +216,7 @@ impl TunnelRunner {
             }
         } else {
             let message = api::format_web_error("activate-tunnel", response).await;
-            let _ = self.events.send(TunnelEvent::Error(message));
+            eprintln!("\x1b[2m[bridge] activate-tunnel failed (non-fatal): {message}\x1b[0m");
             let _ = self.sync_tools().await;
         }
         Ok(())
@@ -251,9 +251,7 @@ fn parse_sync_tools_body(body: &Value, events: &broadcast::Sender<TunnelEvent>) 
     if count == 0 {
         eprintln!("\x1b[2m[bridge] sync-tools response: {body}\x1b[0m");
         if let Some(status) = body.get("status").and_then(Value::as_str) {
-            let _ = events.send(TunnelEvent::Error(format!(
-                "sync-tools returned 0 tools (status: {status})"
-            )));
+            eprintln!("\x1b[2m[bridge] sync-tools returned 0 tools (status: {status})\x1b[0m");
         }
     }
     let _ = events.send(TunnelEvent::ToolsSynced { tool_count: count });
