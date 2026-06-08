@@ -159,7 +159,6 @@ impl TunnelRunner {
             result = self.activate_tunnel(&info.connection_id) => result?,
             _ = &mut deadline => return Err(Error::Protocol("connection timeout during activation".into())),
         }
-        let _ = self.sync_tools().await;
         let _ = self.events.send(TunnelEvent::Connected(info.clone()));
         Ok(info)
     }

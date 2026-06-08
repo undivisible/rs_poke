@@ -6,6 +6,8 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
@@ -330,29 +332,119 @@ where
 
 async fn read_http_request(input: &mut mpsc::UnboundedReceiver<StreamInput>) -> Result<Bytes> {
     let mut bytes = BytesMut::new();
-    while let Some(item) = input.recv().await {
-        match item {
-            StreamInput::Data(chunk) => {
+    loop {
+        match input.recv().await {
+            Some(StreamInput::Data(chunk)) => {
                 bytes.extend_from_slice(&chunk);
                 if bytes.len() > MAX_HEADER_BYTES && find_header_end(&bytes).is_none() {
                     return Err(Error::Protocol("headers too large".into()));
                 }
                 if let Some(header_end) = find_header_end(&bytes) {
-                    let content_length = parse_content_length(&bytes[..header_end]).unwrap_or(0);
-                    let total = header_end + content_length;
-                    while bytes.len() < total {
-                        match input.recv().await {
-                            Some(StreamInput::Data(chunk)) => bytes.extend_from_slice(&chunk),
-                            _ => break,
+                    let headers = &bytes[..header_end];
+                    if let Some(content_length) = parse_content_length(headers) {
+                        if content_length > MAX_RESPONSE_BODY {
+                            return Err(Error::Protocol(format!(
+                                "request body too large: {content_length} bytes"
+                            )));
                         }
+                        let total = header_end + content_length;
+                        while bytes.len() < total {
+                            match input.recv().await {
+                                Some(StreamInput::Data(chunk)) => bytes.extend_from_slice(&chunk),
+                                Some(StreamInput::Finish) => {
+                                    return Err(Error::Protocol(
+                                        "request body incomplete before stream closed".into(),
+                                    ));
+                                }
+                                None => {
+                                    return Err(Error::Protocol(
+                                        "request body incomplete before stream closed".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        return Ok(bytes.freeze());
+                    }
+                    if parse_transfer_encoding_chunked(headers) {
+                        return read_chunked_body(input, &mut bytes, header_end).await;
                     }
                     return Ok(bytes.freeze());
                 }
             }
-            StreamInput::Finish => return Ok(bytes.freeze()),
+            Some(StreamInput::Finish) => return Ok(bytes.freeze()),
+            None => return Ok(bytes.freeze()),
         }
     }
-    Ok(bytes.freeze())
+}
+
+async fn read_chunked_body(
+    input: &mut mpsc::UnboundedReceiver<StreamInput>,
+    bytes: &mut BytesMut,
+    header_end: usize,
+) -> Result<Bytes> {
+    let mut body = BytesMut::new();
+    let mut pending = bytes.split_off(header_end).freeze();
+    loop {
+        while find_crlf(&pending).is_none() {
+            match input.recv().await {
+                Some(StreamInput::Data(chunk)) => {
+                    let mut merged = BytesMut::from(pending.as_ref());
+                    merged.extend_from_slice(&chunk);
+                    pending = merged.freeze();
+                }
+                Some(StreamInput::Finish) | None => {
+                    return Err(Error::Protocol("chunked body incomplete".into()));
+                }
+            }
+        }
+        let line_end = find_crlf(&pending).expect("chunk size line");
+        let size_line = std::str::from_utf8(&pending[..line_end])
+            .map_err(|err| Error::Protocol(err.to_string()))?;
+        let chunk_size = usize::from_str_radix(size_line.trim(), 16)
+            .map_err(|err| Error::Protocol(err.to_string()))?;
+        pending = pending.slice(line_end + 2..);
+        if chunk_size == 0 {
+            bytes.extend_from_slice(&body);
+            return Ok(bytes.clone().freeze());
+        }
+        if body.len() + chunk_size > MAX_RESPONSE_BODY {
+            return Err(Error::Protocol("chunked body too large".into()));
+        }
+        while pending.len() < chunk_size + 2 {
+            match input.recv().await {
+                Some(StreamInput::Data(chunk)) => {
+                    let mut merged = BytesMut::from(pending.as_ref());
+                    merged.extend_from_slice(&chunk);
+                    pending = merged.freeze();
+                }
+                Some(StreamInput::Finish) | None => {
+                    return Err(Error::Protocol("chunked body incomplete".into()));
+                }
+            }
+        }
+        body.extend_from_slice(&pending[..chunk_size]);
+        pending = pending.slice(chunk_size + 2..);
+    }
+}
+
+fn find_crlf(bytes: impl AsRef<[u8]>) -> Option<usize> {
+    let bytes = bytes.as_ref();
+    bytes.windows(2).position(|window| window == b"\r\n")
+}
+
+fn parse_transfer_encoding_chunked(headers: &[u8]) -> bool {
+    let text = match std::str::from_utf8(headers) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    for line in text.lines() {
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            return value.to_ascii_lowercase().contains("chunked");
+        }
+    }
+    false
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
@@ -447,53 +539,166 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 }
 
 async fn forward_http(local_addr: &str, request: HttpRequest) -> Result<Bytes> {
-    let client = reqwest::Client::builder()
-        .no_gzip()
-        .no_brotli()
-        .no_zstd()
-        .no_deflate()
-        .build()?;
-    let method = reqwest::Method::from_bytes(request.method.as_bytes())
-        .map_err(|err| Error::Protocol(err.to_string()))?;
-    let mut builder = client
-        .request(method, format!("http://{local_addr}{}", request.path))
-        .header("host", local_addr);
-    for (name, value) in request.headers {
-        builder = builder.header(name, value);
-    }
-    if !request.body.is_empty() {
-        builder = builder.body(request.body);
-    }
-    let response = builder.send().await?;
-    build_response(response).await
+    let mut stream = TcpStream::connect(local_addr).await?;
+    stream
+        .write_all(&encode_forward_request(local_addr, &request))
+        .await?;
+    read_http_response(&mut stream).await
 }
 
-async fn build_response(response: reqwest::Response) -> Result<Bytes> {
-    let status = response.status();
-    let reason = status.canonical_reason().unwrap_or("OK");
+fn encode_forward_request(local_addr: &str, request: &HttpRequest) -> Bytes {
+    let mut bytes = BytesMut::new();
+    bytes.extend_from_slice(format!("{} {} HTTP/1.1\r\n", request.method, request.path).as_bytes());
+    bytes.extend_from_slice(format!("host: {local_addr}\r\n").as_bytes());
+    let mut has_content_length = false;
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            has_content_length = true;
+        }
+        bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    if !request.body.is_empty() && !has_content_length {
+        bytes.extend_from_slice(format!("content-length: {}\r\n", request.body.len()).as_bytes());
+    }
+    bytes.extend_from_slice(b"\r\n");
+    bytes.extend_from_slice(&request.body);
+    bytes.freeze()
+}
+
+async fn read_http_response(stream: &mut TcpStream) -> Result<Bytes> {
+    let mut bytes = BytesMut::new();
+    let mut chunk = [0u8; 32_768];
+    loop {
+        if let Some(header_end) = find_header_end(&bytes) {
+            let headers = &bytes[..header_end];
+            if let Some(content_length) = parse_content_length(headers) {
+                if content_length > MAX_RESPONSE_BODY {
+                    return Err(Error::Protocol("response body exceeds size limit".into()));
+                }
+                let total = header_end + content_length;
+                while bytes.len() < total {
+                    let read = stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        return Err(Error::Protocol("response body incomplete".into()));
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                }
+                return Ok(normalize_response(bytes.freeze()));
+            }
+            if parse_transfer_encoding_chunked(headers) {
+                let body = read_chunked_response_body(stream, bytes.split_off(header_end).freeze())
+                    .await?;
+                bytes.extend_from_slice(&body);
+                return Ok(normalize_response(bytes.freeze()));
+            }
+            return Ok(normalize_response(bytes.freeze()));
+        }
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > MAX_HEADER_BYTES && find_header_end(&bytes).is_none() {
+            return Err(Error::Protocol("response headers too large".into()));
+        }
+    }
+    if bytes.is_empty() {
+        return Err(Error::Protocol("empty response from upstream".into()));
+    }
+    Ok(normalize_response(bytes.freeze()))
+}
+
+async fn read_chunked_response_body(stream: &mut TcpStream, mut pending: Bytes) -> Result<Bytes> {
+    let mut body = BytesMut::new();
+    let mut chunk = [0u8; 32_768];
+    loop {
+        while find_crlf(&pending).is_none() {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(Error::Protocol("chunked response incomplete".into()));
+            }
+            let mut merged = BytesMut::from(pending.as_ref());
+            merged.extend_from_slice(&chunk[..read]);
+            pending = merged.freeze();
+        }
+        let line_end = find_crlf(&pending).expect("chunk size line");
+        let size_line = std::str::from_utf8(&pending[..line_end])
+            .map_err(|err| Error::Protocol(err.to_string()))?;
+        let chunk_size = usize::from_str_radix(size_line.trim(), 16)
+            .map_err(|err| Error::Protocol(err.to_string()))?;
+        pending = pending.slice(line_end + 2..);
+        if chunk_size == 0 {
+            return Ok(body.freeze());
+        }
+        if body.len() + chunk_size > MAX_RESPONSE_BODY {
+            return Err(Error::Protocol("response body exceeds size limit".into()));
+        }
+        while pending.len() < chunk_size + 2 {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(Error::Protocol("chunked response incomplete".into()));
+            }
+            let mut merged = BytesMut::from(pending.as_ref());
+            merged.extend_from_slice(&chunk[..read]);
+            pending = merged.freeze();
+        }
+        body.extend_from_slice(&pending[..chunk_size]);
+        pending = pending.slice(chunk_size + 2..);
+    }
+}
+
+fn normalize_response(raw: Bytes) -> Bytes {
+    let header_end = match find_header_end(&raw) {
+        Some(end) => end,
+        None => return raw,
+    };
+    let header_text = match std::str::from_utf8(&raw[..header_end]) {
+        Ok(text) => text,
+        Err(_) => return raw,
+    };
+    let mut lines = header_text.split("\r\n");
+    let status_line = match lines.next() {
+        Some(line) => line,
+        None => return raw,
+    };
+    let mut status_parts = status_line.split_whitespace();
+    let version = status_parts.next().unwrap_or("HTTP/1.1");
+    let status_code = status_parts.next().unwrap_or("500");
+    let reason = status_parts.collect::<Vec<_>>().join(" ");
+    let reason = if reason.is_empty() {
+        "OK"
+    } else {
+        reason.as_str()
+    };
+    let body = raw.slice(header_end..);
     let mut headers = Vec::new();
-    for (name, value) in response.headers() {
-        if is_hop_by_hop_header(name.as_str())
-            || name.as_str().eq_ignore_ascii_case("content-length")
-        {
+    for line in lines {
+        if line.is_empty() {
             continue;
         }
-        if let Ok(value) = value.to_str() {
-            headers.push((name.as_str().to_string(), value.to_string()));
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if is_hop_by_hop_header(name) || name.eq_ignore_ascii_case("content-length") {
+            continue;
         }
-    }
-    let body = response.bytes().await?;
-    if body.len() > MAX_RESPONSE_BODY {
-        return Err(Error::Protocol("response body exceeds size limit".into()));
+        headers.push((
+            sanitize_header_value(name.trim()),
+            sanitize_header_value(value.trim()),
+        ));
     }
     let mut bytes = BytesMut::new();
-    bytes.extend_from_slice(format!("HTTP/1.1 {} {reason}\r\n", status.as_u16()).as_bytes());
+    bytes.extend_from_slice(format!("{version} {status_code} {reason}\r\n").as_bytes());
     for (name, value) in headers {
         bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
     bytes.extend_from_slice(format!("content-length: {}\r\n\r\n", body.len()).as_bytes());
     bytes.extend_from_slice(&body);
-    Ok(bytes.freeze())
+    bytes.freeze()
+}
+
+fn sanitize_header_value(value: &str) -> String {
+    value.replace(['\r', '\n'], " ")
 }
 
 async fn send_data<W>(write: &Arc<Mutex<W>>, stream_id: u32, data: Bytes) -> Result<()>
@@ -589,5 +794,69 @@ mod tests {
             ]
         );
         assert_eq!(request.body.as_ref(), b"{}");
+    }
+
+    #[tokio::test]
+    async fn read_http_request_waits_for_full_content_length_body() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let payload = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            payload.len()
+        );
+        tx.send(StreamInput::Data(Bytes::from(request))).unwrap();
+        tx.send(StreamInput::Data(Bytes::copy_from_slice(
+            &payload[..payload.len() / 2],
+        )))
+        .unwrap();
+        tx.send(StreamInput::Data(Bytes::copy_from_slice(
+            &payload[payload.len() / 2..],
+        )))
+        .unwrap();
+        let bytes = read_http_request(&mut rx).await.expect("full request");
+        let parsed = parse_request(bytes).expect("parsed request");
+        assert_eq!(parsed.body.as_ref(), payload);
+    }
+
+    #[tokio::test]
+    async fn forward_http_round_trips_through_local_tcp_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0u8; 4096];
+            let read = socket.read(&mut buffer).await.expect("read request");
+            let request = std::str::from_utf8(&buffer[..read]).expect("utf8 request");
+            assert!(request.contains("POST /mcp HTTP/1.1"));
+            assert!(request.contains(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#));
+            let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"run_command"}]}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write headers");
+            socket.write_all(body).await.expect("write body");
+        });
+        let request = parse_request(Bytes::from_static(
+            b"POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 45\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}",
+        ))
+        .expect("request");
+        let response = forward_http(&addr.to_string(), request)
+            .await
+            .expect("forward");
+        let response_text = std::str::from_utf8(&response).expect("utf8 response");
+        assert!(response_text.contains("HTTP/1.1 200 OK"));
+        assert!(response_text.contains("run_command"));
+        assert!(
+            response_text
+                .to_ascii_lowercase()
+                .contains("content-length:")
+        );
+        server.await.expect("server");
     }
 }
