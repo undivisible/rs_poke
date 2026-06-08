@@ -10,16 +10,26 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
+/// Configuration for [`TunnelRunner`].
 #[derive(Clone, Debug)]
 pub struct TunnelOptions {
+    /// Local MCP server URL proxied through the tunnel.
     pub url: String,
+    /// Human-readable integration name sent to the API.
     pub name: String,
+    /// Bearer token override for tunnel API calls.
     pub token: Option<String>,
+    /// API base URL override for tunnel API calls.
     pub base_url: Option<String>,
+    /// Optional OAuth client ID for enterprise connections.
     pub client_id: Option<String>,
+    /// Optional OAuth client secret for enterprise connections.
     pub client_secret: Option<String>,
+    /// Delete the remote connection when the tunnel stops.
     pub cleanup_on_stop: bool,
+    /// Interval for periodic tool sync requests. Zero disables sync.
     pub sync_interval: Duration,
+    /// Maximum time to wait for upstream tunnel connectivity.
     pub startup_timeout: Duration,
 }
 
@@ -54,26 +64,45 @@ struct TunnelConfig {
     upstream_url: String,
 }
 
+/// Metadata for an established tunnel connection.
 #[derive(Clone, Debug)]
 pub struct TunnelInfo {
+    /// Server-assigned connection identifier.
     pub connection_id: String,
+    /// Public tunnel endpoint URL.
     pub tunnel_url: String,
+    /// Local MCP server URL.
     pub local_url: String,
+    /// Integration name associated with the connection.
     pub name: String,
 }
 
+/// Events emitted while a tunnel is running.
 #[derive(Clone, Debug)]
 pub enum TunnelEvent {
+    /// The remote connection record was created.
     Created(TunnelInfo),
+    /// The upstream tunnel is connected and active.
     Connected(TunnelInfo),
+    /// The upstream tunnel disconnected.
     Disconnected,
-    ToolsSynced { tool_count: usize },
-    OAuthRequired { auth_url: String },
+    /// Tool sync completed with the reported count.
+    ToolsSynced {
+        /// Number of tools reported by the API.
+        tool_count: usize,
+    },
+    /// The connection requires OAuth before it can proceed.
+    OAuthRequired {
+        /// URL the user should visit to complete OAuth.
+        auth_url: String,
+    },
+    /// A non-fatal or fatal tunnel error occurred.
     Error(String),
 }
 
 type TunnelHandler = Box<dyn Fn(&TunnelEvent) + Send + Sync>;
 
+/// Manages a single Poke MCP tunnel connection.
 pub struct TunnelRunner {
     client: Poke,
     options: TunnelOptions,
@@ -87,6 +116,7 @@ pub struct TunnelRunner {
 }
 
 impl TunnelRunner {
+    /// Create a tunnel runner bound to an authenticated [`Poke`] client.
     pub fn new(client: Poke, options: TunnelOptions) -> Self {
         let (events, _) = broadcast::channel(64);
         Self {
@@ -102,10 +132,12 @@ impl TunnelRunner {
         }
     }
 
+    /// Subscribe to tunnel lifecycle events.
     pub fn subscribe(&self) -> broadcast::Receiver<TunnelEvent> {
         self.events.subscribe()
     }
 
+    /// Register a handler for a named tunnel event.
     pub fn on<F>(&self, event: &str, handler: F) -> Result<&Self>
     where
         F: Fn(&TunnelEvent) + Send + Sync + 'static,
@@ -119,6 +151,7 @@ impl TunnelRunner {
         Ok(self)
     }
 
+    /// Remove handlers registered for a named tunnel event.
     pub fn off(&self, event: &str) -> Result<()> {
         self.handlers
             .lock()
@@ -127,14 +160,17 @@ impl TunnelRunner {
         Ok(())
     }
 
+    /// Return connection metadata when the tunnel has been created.
     pub fn info(&self) -> Option<&TunnelInfo> {
         self.info.as_ref()
     }
 
+    /// Return whether the upstream tunnel is currently connected.
     pub fn connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
     }
 
+    /// Create the remote connection and start the upstream tunnel.
     pub async fn start(&mut self) -> Result<TunnelInfo> {
         self.start_inner().await
     }
@@ -217,6 +253,7 @@ impl TunnelRunner {
         Ok(info)
     }
 
+    /// Stop the upstream tunnel and optionally delete the remote connection.
     pub async fn stop(&mut self) -> Result<()> {
         self.stop_sync_timer().await;
         if let Some(stop) = self.stop.take() {
@@ -231,6 +268,7 @@ impl TunnelRunner {
         Ok(())
     }
 
+    /// Create a shareable recipe link for the active connection.
     pub async fn create_recipe(&self, name: Option<&str>) -> Result<String> {
         let Some(info) = &self.info else {
             return Err(Error::msg("tunnel is not started"));
@@ -257,6 +295,7 @@ impl TunnelRunner {
             .ok_or_else(|| Error::Api("create-recipe response missing link".into()))
     }
 
+    /// Ask the API to sync tools from the local MCP server.
     pub async fn sync_tools(&self) -> Result<usize> {
         let Some(info) = &self.info else {
             return Err(Error::msg("tunnel is not started"));
@@ -302,6 +341,7 @@ impl TunnelRunner {
         Ok(())
     }
 
+    /// Delete a remote connection by ID.
     pub async fn delete_connection(&self, connection_id: &str) -> Result<()> {
         let _ = self
             .fetch_auth(

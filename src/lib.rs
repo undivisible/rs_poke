@@ -1,5 +1,7 @@
 //! Rust client and tunnel bridge for Poke.
 
+#![warn(missing_docs)]
+
 mod api;
 mod auth;
 mod error;
@@ -14,7 +16,7 @@ pub use api::{
 pub use auth::{
     CredentialsStore, LoginCodeInfo, LoginOptions, LoginResult, Token, config_dir,
     credentials_path, delete_credentials, get_token, is_logged_in, load_credentials, login,
-    logout, save_credentials,
+    login_fresh, logout, save_credentials,
 };
 pub use error::{Error, Result};
 pub use tunnel::{TunnelEvent, TunnelInfo, TunnelOptions, TunnelRunner};

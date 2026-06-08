@@ -7,17 +7,21 @@ use std::time::{Duration, Instant};
 const DEFAULT_API: &str = "https://poke.com/api/v1";
 const DEFAULT_FRONTEND: &str = "https://poke.com";
 
+/// Stored API credentials.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Token {
+    /// Bearer token value.
     pub token: String,
 }
 
+/// JSON credentials file backed by a filesystem path.
 #[derive(Clone, Debug)]
 pub struct CredentialsStore {
     path: PathBuf,
 }
 
 impl CredentialsStore {
+    /// Resolve the default credentials file path under the config directory.
     pub fn default_path() -> Result<PathBuf> {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -26,14 +30,17 @@ impl CredentialsStore {
         Ok(base.join("poke").join("credentials.json"))
     }
 
+    /// Create a store that reads and writes credentials at `path`.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
+    /// Create a store using [`Self::default_path`].
     pub fn default_store() -> Result<Self> {
         Ok(Self::new(Self::default_path()?))
     }
 
+    /// Read stored credentials, returning `None` when the file is absent.
     pub fn read(&self) -> Result<Option<Token>> {
         match std::fs::read_to_string(&self.path) {
             Ok(data) => Ok(Some(serde_json::from_str(&data)?)),
@@ -42,6 +49,7 @@ impl CredentialsStore {
         }
     }
 
+    /// Persist a token to disk with restrictive permissions on Unix.
     pub fn write(&self, token: &str) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -60,6 +68,7 @@ impl CredentialsStore {
         Ok(())
     }
 
+    /// Delete the credentials file if it exists.
     pub fn remove(&self) -> Result<()> {
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -69,6 +78,7 @@ impl CredentialsStore {
     }
 }
 
+/// Return the Poke config directory (`~/.config/poke` or `$XDG_CONFIG_HOME/poke`).
 pub fn config_dir() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -77,39 +87,56 @@ pub fn config_dir() -> Result<PathBuf> {
     Ok(base.join("poke"))
 }
 
+/// Return the default credentials file path.
 pub fn credentials_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("credentials.json"))
 }
 
+/// Save credentials to the default store.
 pub fn save_credentials(token: &str) -> Result<()> {
     CredentialsStore::default_store()?.write(token)
 }
 
+/// Load credentials from the default store.
 pub fn load_credentials() -> Result<Option<Token>> {
     CredentialsStore::default_store()?.read()
 }
 
+/// Delete credentials from the default store.
 pub fn delete_credentials() -> Result<()> {
     CredentialsStore::default_store()?.remove()
 }
 
+/// Device-login code and URL shown to the user during CLI auth.
 #[derive(Clone, Debug)]
 pub struct LoginCodeInfo {
+    /// Short code the user enters in the browser.
     pub user_code: String,
+    /// Full device-login URL.
     pub login_url: String,
 }
 
+/// Options for [`login`] and [`login_fresh`].
 pub struct LoginOptions {
+    /// API base URL for device-login endpoints.
     pub api_base: String,
+    /// Frontend base URL used to build the device-login page.
     pub frontend_base: String,
+    /// Whether to open the device-login URL in a browser.
     pub open_browser: bool,
+    /// Maximum time to wait for the user to complete login.
     pub timeout: Duration,
+    /// Delay between poll requests while waiting for login.
     pub poll_interval: Duration,
+    /// Credentials store used to persist the resulting token.
     pub store: CredentialsStore,
+    /// Skip cached credentials and always start a new device-login flow.
+    pub force_new: bool,
     on_code: Option<Box<dyn Fn(LoginCodeInfo) + Send + Sync>>,
 }
 
 impl LoginOptions {
+    /// Create login options with API and frontend defaults.
     pub fn new(store: CredentialsStore) -> Self {
         Self {
             api_base: std::env::var("POKE_API").unwrap_or_else(|_| DEFAULT_API.to_string()),
@@ -119,10 +146,12 @@ impl LoginOptions {
             timeout: Duration::from_secs(300),
             poll_interval: Duration::from_secs(2),
             store,
+            force_new: false,
             on_code: None,
         }
     }
 
+    /// Register a callback invoked when the device-login code is available.
     pub fn on_code<F>(mut self, handler: F) -> Self
     where
         F: Fn(LoginCodeInfo) + Send + Sync + 'static,
@@ -132,8 +161,10 @@ impl LoginOptions {
     }
 }
 
+/// Successful CLI login result.
 #[derive(Clone, Debug)]
 pub struct LoginResult {
+    /// Authenticated API token.
     pub token: String,
 }
 
@@ -151,21 +182,29 @@ struct PollResponse {
     token: Option<String>,
 }
 
+/// Load the stored API token, if any.
 pub fn get_token() -> Result<Option<String>> {
     Ok(CredentialsStore::default_store()?
         .read()?
         .map(|token| token.token))
 }
 
+/// Return whether credentials are stored locally.
 pub fn is_logged_in() -> bool {
     get_token().ok().flatten().is_some()
 }
 
+/// Authenticate via device login, reusing stored credentials when present.
 pub async fn login(options: LoginOptions) -> Result<LoginResult> {
-    if let Some(token) = options.store.read()? {
+    if !options.force_new
+        && let Some(token) = options.store.read()?
+    {
         return Ok(LoginResult {
             token: token.token,
         });
+    }
+    if options.force_new {
+        options.store.remove()?;
     }
     let client = reqwest::Client::new();
     let code = client
@@ -218,6 +257,14 @@ pub async fn login(options: LoginOptions) -> Result<LoginResult> {
     Err(auth_error("login timed out"))
 }
 
+/// Clear stored credentials and start a fresh device-login flow.
+pub async fn login_fresh(options: LoginOptions) -> Result<LoginResult> {
+    let mut options = options;
+    options.force_new = true;
+    login(options).await
+}
+
+/// Delete stored credentials.
 pub async fn logout() -> Result<()> {
     delete_credentials()
 }

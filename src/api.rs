@@ -39,8 +39,10 @@ pub struct Poke {
 /// Response from [`Poke::send_message`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SendMessageResponse {
+    /// Whether the API accepted the message.
     #[serde(default = "default_true")]
     pub success: bool,
+    /// Optional status text from the API.
     #[serde(default)]
     pub message: String,
 }
@@ -48,6 +50,7 @@ pub struct SendMessageResponse {
 /// Response from [`Poke::send_webhook`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SendWebhookResponse {
+    /// Whether the webhook accepted the payload.
     #[serde(default = "default_true")]
     pub success: bool,
 }
@@ -55,10 +58,13 @@ pub struct SendWebhookResponse {
 /// Response from [`Poke::create_webhook`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateWebhookResponse {
+    /// Server-assigned trigger identifier.
     #[serde(rename = "triggerId", default)]
     pub trigger_id: String,
+    /// URL to POST webhook payloads to.
     #[serde(rename = "webhookUrl")]
     pub webhook_url: String,
+    /// Bearer token for webhook authentication.
     #[serde(rename = "webhookToken")]
     pub webhook_token: String,
 }
@@ -66,7 +72,9 @@ pub struct CreateWebhookResponse {
 /// Request body for [`Poke::create_webhook`].
 #[derive(Clone, Debug, Serialize)]
 pub struct CreateWebhook<'a> {
+    /// Trigger condition expression.
     pub condition: &'a str,
+    /// Action to run when the condition matches.
     pub action: &'a str,
 }
 
@@ -106,11 +114,17 @@ pub(crate) fn auth_error(message: impl Into<String>) -> Error {
 /// Options for [`fetch_with_auth`].
 #[derive(Clone, Debug)]
 pub struct FetchWithAuthOptions<'a> {
+    /// API path appended to the base URL.
     pub path: &'a str,
+    /// HTTP method for the request.
     pub method: reqwest::Method,
+    /// Optional JSON request body.
     pub body: Option<Value>,
+    /// Bearer token override. Falls back to env or stored credentials.
     pub token: Option<String>,
+    /// API base URL override. Falls back to `POKE_API` or the default host.
     pub base_url: Option<String>,
+    /// HTTP client override. Falls back to the shared client.
     pub client: Option<reqwest::Client>,
 }
 
@@ -239,6 +253,9 @@ pub async fn fetch_with_auth(options: FetchWithAuthOptions<'_>) -> Result<reqwes
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         return Err(auth_error("session expired. Run 'poke login' again."));
     }
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err(auth_error("api key lacks permission"));
+    }
     Ok(response)
 }
 
@@ -321,5 +338,30 @@ mod tests {
     fn poke_auth_error_converts_to_error_variant() {
         let err: Error = PokeAuthError::new("expired").into();
         assert!(matches!(err, Error::Auth(message) if message == "expired"));
+    }
+
+    #[tokio::test]
+    async fn fetch_with_auth_maps_401_to_session_expired() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/protected"))
+            .respond_with(wiremock::ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let err = fetch_with_auth(FetchWithAuthOptions {
+            path: "/protected",
+            method: reqwest::Method::GET,
+            body: None,
+            token: Some("pk_test".into()),
+            base_url: Some(server.uri()),
+            client: None,
+        })
+        .await
+        .expect_err("401 should fail");
+
+        assert!(
+            matches!(err, Error::Auth(message) if message == "session expired. Run 'poke login' again.")
+        );
     }
 }
