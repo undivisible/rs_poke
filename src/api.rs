@@ -134,7 +134,7 @@ impl Poke {
     }
 }
 
-async fn format_web_error(prefix: &str, response: reqwest::Response) -> String {
+pub(crate) async fn format_web_error(prefix: &str, response: reqwest::Response) -> String {
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     let detail = serde_json::from_str::<Value>(&text)

@@ -1,4 +1,4 @@
-use crate::api::Poke;
+use crate::api::{self, Poke};
 use crate::piko::{PikoConfig, run_client};
 use crate::{Error, Result};
 use serde::Deserialize;
@@ -13,6 +13,18 @@ pub struct TunnelOptions {
     pub cleanup_on_stop: bool,
     pub sync_interval: Duration,
     pub startup_timeout: Duration,
+}
+
+impl Default for TunnelOptions {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            name: String::new(),
+            cleanup_on_stop: true,
+            sync_interval: Duration::from_secs(300),
+            startup_timeout: Duration::from_secs(30),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -147,6 +159,7 @@ impl TunnelRunner {
             result = self.activate_tunnel(&info.connection_id) => result?,
             _ = &mut deadline => return Err(Error::Protocol("connection timeout during activation".into())),
         }
+        let _ = self.sync_tools().await;
         let _ = self.events.send(TunnelEvent::Connected(info.clone()));
         Ok(info)
     }
@@ -175,31 +188,13 @@ impl TunnelRunner {
                 None,
             )
             .await?;
-        if response.status().is_success() {
-            let body = response.json::<Value>().await?;
-            if body
-                .get("requiresOAuth")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                && let Some(url) = body.get("oauthUrl").and_then(Value::as_str)
-            {
-                let _ = self.events.send(TunnelEvent::OAuthRequired {
-                    auth_url: url.to_string(),
-                });
-                return Ok(0);
-            }
-            let count = body
-                .get("tools")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            let _ = self
-                .events
-                .send(TunnelEvent::ToolsSynced { tool_count: count });
-            Ok(count)
-        } else {
-            Ok(0)
+        if !response.status().is_success() {
+            let message = api::format_web_error("sync-tools", response).await;
+            let _ = self.events.send(TunnelEvent::Error(message.clone()));
+            return Err(Error::Api(message));
         }
+        let body = response.json::<Value>().await?;
+        parse_sync_tools_body(&body, &self.events)
     }
 
     async fn activate_tunnel(&self, connection_id: &str) -> Result<()> {
@@ -221,6 +216,8 @@ impl TunnelRunner {
                 });
             }
         } else {
+            let message = api::format_web_error("activate-tunnel", response).await;
+            let _ = self.events.send(TunnelEvent::Error(message));
             let _ = self.sync_tools().await;
         }
         Ok(())
@@ -237,6 +234,27 @@ impl TunnelRunner {
             .await?;
         Ok(())
     }
+}
+
+fn parse_sync_tools_body(body: &Value, events: &broadcast::Sender<TunnelEvent>) -> Result<usize> {
+    if body
+        .get("requiresOAuth")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && let Some(url) = body.get("oauthUrl").and_then(Value::as_str)
+    {
+        let _ = events.send(TunnelEvent::OAuthRequired {
+            auth_url: url.to_string(),
+        });
+        return Ok(0);
+    }
+    let count = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let _ = events.send(TunnelEvent::ToolsSynced { tool_count: count });
+    Ok(count)
 }
 
 fn local_addr(url: &str) -> Result<String> {
@@ -260,5 +278,40 @@ mod tests {
             local_addr("http://127.0.0.1:52333/mcp").expect("local addr"),
             "127.0.0.1:52333"
         );
+    }
+
+    #[test]
+    fn default_tunnel_options_use_thirty_second_startup_timeout() {
+        assert_eq!(
+            TunnelOptions::default().startup_timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn parse_sync_tools_body_counts_tools() {
+        let (events, _) = broadcast::channel(1);
+        let body = serde_json::json!({
+            "tools": [{ "name": "run_command" }, { "name": "read_file" }]
+        });
+        let count = parse_sync_tools_body(&body, &events).expect("tools parse");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_sync_tools_body_emits_oauth_required() {
+        let (events, mut rx) = broadcast::channel(1);
+        let body = serde_json::json!({
+            "requiresOAuth": true,
+            "oauthUrl": "https://poke.com/oauth"
+        });
+        let count = parse_sync_tools_body(&body, &events).expect("oauth parse");
+        assert_eq!(count, 0);
+        match rx.try_recv().expect("oauth event") {
+            TunnelEvent::OAuthRequired { auth_url } => {
+                assert_eq!(auth_url, "https://poke.com/oauth");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }
