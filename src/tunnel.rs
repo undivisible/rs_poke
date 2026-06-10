@@ -1,4 +1,4 @@
-use crate::api::{self, fetch_with_auth, FetchWithAuthOptions, Poke};
+use crate::api::{self, FetchWithAuthOptions, Poke, fetch_with_auth};
 use crate::piko::{PikoConfig, run_client};
 use crate::{Error, Result};
 use serde::Deserialize;
@@ -410,6 +410,7 @@ impl TunnelRunner {
         self.sync_task = Some(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await;
+            let mut consecutive_failures = 0u32;
             loop {
                 tokio::select! {
                     _ = sync_stop_rx.changed() => {
@@ -421,30 +422,17 @@ impl TunnelRunner {
                         let Some(info) = &runner.info else {
                             continue;
                         };
-                        match runner
-                            .fetch_auth(
-                                reqwest::Method::POST,
-                                &format!("/mcp/connections/{}/sync-tools", info.connection_id),
-                                None,
-                            )
+                        match periodic_sync_tools(&runner, &info.connection_id, &events, &handlers)
                             .await
                         {
-                            Ok(response) if response.status().is_success() => {
-                                if let Ok(body) = response.json::<Value>().await {
-                                    let _ = parse_sync_tools_body(&body, &events, &handlers);
+                            Ok(()) => consecutive_failures = 0,
+                            Err(message) => {
+                                consecutive_failures += 1;
+                                if consecutive_failures == 1 || consecutive_failures % 5 == 0 {
+                                    eprintln!(
+                                        "\x1b[2m[bridge] periodic sync-tools failed (non-fatal): {message}\x1b[0m"
+                                    );
                                 }
-                            }
-                            Ok(response) => {
-                                let message =
-                                    api::format_web_error("sync-tools", response).await;
-                                eprintln!(
-                                    "\x1b[2m[bridge] periodic sync-tools failed (non-fatal): {message}\x1b[0m"
-                                );
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "\x1b[2m[bridge] periodic sync-tools failed (non-fatal): {err}\x1b[0m"
-                                );
                             }
                         }
                     }
@@ -520,6 +508,43 @@ fn emit_event(
     let _ = events.send(event);
 }
 
+const PERIODIC_SYNC_MAX_ATTEMPTS: usize = 3;
+const PERIODIC_SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+async fn periodic_sync_tools(
+    runner: &SyncRunner,
+    connection_id: &str,
+    events: &broadcast::Sender<TunnelEvent>,
+    handlers: &Arc<Mutex<HashMap<String, Vec<TunnelHandler>>>>,
+) -> std::result::Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 1..=PERIODIC_SYNC_MAX_ATTEMPTS {
+        match runner
+            .fetch_auth(
+                reqwest::Method::POST,
+                &format!("/mcp/connections/{connection_id}/sync-tools"),
+                None,
+            )
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                if let Ok(body) = response.json::<Value>().await {
+                    let _ = parse_sync_tools_body(&body, events, handlers);
+                }
+                return Ok(());
+            }
+            Ok(response) => {
+                last_error = api::format_web_error("sync-tools", response).await;
+            }
+            Err(err) => last_error = err.to_string(),
+        }
+        if attempt < PERIODIC_SYNC_MAX_ATTEMPTS {
+            tokio::time::sleep(PERIODIC_SYNC_RETRY_DELAY).await;
+        }
+    }
+    Err(last_error)
+}
+
 fn parse_sync_tools_body(
     body: &Value,
     events: &broadcast::Sender<TunnelEvent>,
@@ -541,7 +566,7 @@ fn parse_sync_tools_body(
         return Ok(0);
     }
     let count = parse_tool_count(body);
-    if count == 0 {
+    if count == 0 && !is_sync_tools_success(body) {
         eprintln!("\x1b[2m[bridge] sync-tools response: {body}\x1b[0m");
         if let Some(status) = body.get("status").and_then(Value::as_str) {
             eprintln!("\x1b[2m[bridge] sync-tools returned 0 tools (status: {status})\x1b[0m");
@@ -553,6 +578,10 @@ fn parse_sync_tools_body(
         TunnelEvent::ToolsSynced { tool_count: count },
     );
     Ok(count)
+}
+
+fn is_sync_tools_success(body: &Value) -> bool {
+    body.get("success").and_then(Value::as_bool) == Some(true)
 }
 
 fn parse_tool_count(body: &Value) -> usize {
@@ -614,6 +643,19 @@ mod tests {
         });
         let count = parse_sync_tools_body(&body, &events, &handlers).expect("tools parse");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_sync_tools_body_treats_success_without_count_as_ok() {
+        let (events, _) = broadcast::channel(1);
+        let handlers = Arc::new(Mutex::new(HashMap::new()));
+        let body = serde_json::json!({
+            "message": "Tools synced successfully",
+            "success": true
+        });
+        let count = parse_sync_tools_body(&body, &events, &handlers).expect("success parse");
+        assert_eq!(count, 0);
+        assert!(is_sync_tools_success(&body));
     }
 
     #[test]
