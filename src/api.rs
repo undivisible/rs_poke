@@ -167,7 +167,10 @@ impl Poke {
     }
 
     /// Create a webhook trigger.
-    pub async fn create_webhook(&self, request: CreateWebhook<'_>) -> Result<CreateWebhookResponse> {
+    pub async fn create_webhook(
+        &self,
+        request: CreateWebhook<'_>,
+    ) -> Result<CreateWebhookResponse> {
         self.post_json("/api-keys/webhook", &request).await
     }
 

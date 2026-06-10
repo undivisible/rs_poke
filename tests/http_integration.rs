@@ -1,6 +1,6 @@
 use rs_poke::{
-    CredentialsStore, FetchWithAuthOptions, LoginOptions, Poke, PokeOptions, fetch_with_auth, login,
-    login_fresh,
+    CredentialsStore, FetchWithAuthOptions, LoginOptions, Poke, PokeOptions, fetch_with_auth,
+    login, login_fresh,
 };
 use std::time::Duration;
 use wiremock::matchers::{method, path, path_regex};
@@ -57,9 +57,7 @@ async fn login_device_flow_persists_token_from_mock_api() {
     options.open_browser = false;
     options.timeout = Duration::from_secs(5);
     options.poll_interval = Duration::from_millis(50);
-    let result = login(options)
-    .await
-    .expect("login should succeed");
+    let result = login(options).await.expect("login should succeed");
 
     assert_eq!(result.token, "pk_mock_token");
     assert_eq!(
@@ -103,8 +101,8 @@ async fn login_fresh_ignores_cached_credentials() {
     options.timeout = Duration::from_secs(5);
     options.poll_interval = Duration::from_millis(50);
     let result = login_fresh(options)
-    .await
-    .expect("fresh login should succeed");
+        .await
+        .expect("fresh login should succeed");
 
     assert_eq!(result.token, "pk_fresh_token");
 }

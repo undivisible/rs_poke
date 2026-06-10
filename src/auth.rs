@@ -199,9 +199,7 @@ pub async fn login(options: LoginOptions) -> Result<LoginResult> {
     if !options.force_new
         && let Some(token) = options.store.read()?
     {
-        return Ok(LoginResult {
-            token: token.token,
-        });
+        return Ok(LoginResult { token: token.token });
     }
     if options.force_new {
         options.store.remove()?;

@@ -4,7 +4,10 @@ use rs_poke::{
     TunnelRunner, fetch_with_auth, get_token, is_logged_in, login, logout,
 };
 #[derive(Parser)]
-#[command(name = "poke", about = "Poke CLI - Create tunnels to expose local servers")]
+#[command(
+    name = "poke",
+    about = "Poke CLI - Create tunnels to expose local servers"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
