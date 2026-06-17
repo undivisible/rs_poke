@@ -261,8 +261,12 @@ impl TunnelRunner {
         }
         if self.options.cleanup_on_stop
             && let Some(info) = self.info.take()
+            && let Err(err) = self.delete_connection(&info.connection_id).await
         {
-            let _ = self.delete_connection(&info.connection_id).await;
+            eprintln!(
+                "\x1b[2m[bridge] cleanup delete failed for {}: {err}\x1b[0m",
+                info.connection_id
+            );
         }
         self.connected.store(false, Ordering::SeqCst);
         Ok(())
@@ -343,14 +347,20 @@ impl TunnelRunner {
 
     /// Delete a remote connection by ID.
     pub async fn delete_connection(&self, connection_id: &str) -> Result<()> {
-        let _ = self
+        let response = self
             .fetch_auth(
                 reqwest::Method::DELETE,
                 &format!("/mcp/connections/{connection_id}"),
                 None,
             )
             .await?;
-        Ok(())
+        let status = response.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        let message = api::format_web_error("delete-connection", response).await;
+        eprintln!("\x1b[2m[bridge] delete-connection failed for {connection_id}: {message}\x1b[0m");
+        Err(Error::Api(message))
     }
 
     async fn fetch_auth(

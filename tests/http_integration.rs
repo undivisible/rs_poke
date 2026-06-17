@@ -1,6 +1,6 @@
 use rs_poke::{
-    CredentialsStore, FetchWithAuthOptions, LoginOptions, Poke, PokeOptions, fetch_with_auth,
-    login, login_fresh,
+    CredentialsStore, FetchWithAuthOptions, LoginOptions, Poke, PokeOptions, TunnelOptions,
+    TunnelRunner, fetch_with_auth, login, login_fresh,
 };
 use std::time::Duration;
 use wiremock::matchers::{method, path, path_regex};
@@ -147,4 +147,70 @@ async fn tunnel_create_posts_to_cli_connections_endpoint() {
     assert_eq!(body["id"], "conn-42");
     assert_eq!(body["serverUrl"], "https://tunnel.poke.test/conn-42");
     assert_eq!(body["tunnel"]["token"], "tunnel-token");
+}
+
+#[tokio::test]
+async fn delete_connection_succeeds_on_200_and_404() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp/connections/conn-gone"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp/connections/conn-live"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let poke = Poke::new(PokeOptions {
+        api_key: Some("pk_test".into()),
+        base_url: server.uri(),
+    })
+    .expect("poke client");
+    let runner = TunnelRunner::new(
+        poke,
+        TunnelOptions {
+            cleanup_on_stop: false,
+            ..TunnelOptions::default()
+        },
+    );
+
+    runner
+        .delete_connection("conn-gone")
+        .await
+        .expect("404 should be treated as deleted");
+    runner
+        .delete_connection("conn-live")
+        .await
+        .expect("200 should succeed");
+}
+
+#[tokio::test]
+async fn delete_connection_returns_error_on_server_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp/connections/conn-bad"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .mount(&server)
+        .await;
+
+    let poke = Poke::new(PokeOptions {
+        api_key: Some("pk_test".into()),
+        base_url: server.uri(),
+    })
+    .expect("poke client");
+    let runner = TunnelRunner::new(
+        poke,
+        TunnelOptions {
+            cleanup_on_stop: false,
+            ..TunnelOptions::default()
+        },
+    );
+
+    let err = runner
+        .delete_connection("conn-bad")
+        .await
+        .expect_err("500 should fail");
+    assert!(matches!(err, rs_poke::Error::Api(message) if message.contains("delete-connection")));
 }
