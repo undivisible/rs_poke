@@ -438,7 +438,7 @@ impl TunnelRunner {
                             Ok(()) => consecutive_failures = 0,
                             Err(message) => {
                                 consecutive_failures += 1;
-                                if consecutive_failures == 1 || consecutive_failures % 5 == 0 {
+                                if consecutive_failures == 1 || consecutive_failures.is_multiple_of(5) {
                                     eprintln!(
                                         "\x1b[2m[bridge] periodic sync-tools failed (non-fatal): {message}\x1b[0m"
                                     );
