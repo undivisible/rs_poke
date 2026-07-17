@@ -2,7 +2,7 @@
 name = "rs_poke"
 version = "0.2.4"
 edition = "2024"
-license = "MPL-2.0"
+license = "ISC"
 repository = "https://github.com/undivisible/rs_poke"
 description = "Rust client and tunnel bridge for Poke"
 readme = "README.md"
