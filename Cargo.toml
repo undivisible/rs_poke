@@ -1,6 +1,6 @@
 [package]
 name = "rs_poke"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 license = "ISC"
 repository = "https://github.com/undivisible/rs_poke"
