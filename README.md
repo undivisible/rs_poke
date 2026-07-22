@@ -168,4 +168,4 @@ cargo fmt
 
 ## License
 
-Licensed under the Mozilla Public License 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the ISC License. See [LICENSE](LICENSE) for details.
